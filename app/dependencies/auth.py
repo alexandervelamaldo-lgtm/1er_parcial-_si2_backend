@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.clientes import Cliente
+from app.models.talleres import Taller
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.utils.auth import get_subject_from_token
@@ -67,3 +68,13 @@ async def get_current_tecnico_id(
         return None
     tecnico = await db.scalar(select(Tecnico.id).where(Tecnico.user_id == current_user.id))
     return tecnico
+
+
+async def get_current_taller_id(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> int | None:
+    if "TALLER" not in get_role_names(current_user):
+        return None
+    taller = await db.scalar(select(Taller.id).where(Taller.user_id == current_user.id))
+    return taller

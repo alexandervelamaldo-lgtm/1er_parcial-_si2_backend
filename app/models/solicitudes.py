@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -21,6 +21,17 @@ class Solicitud(Base):
     longitud_incidente: Mapped[float] = mapped_column(Float, nullable=False)
     descripcion: Mapped[str] = mapped_column(Text, nullable=False)
     foto_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clasificacion_confianza: Mapped[float | None] = mapped_column(Float, nullable=True)
+    requiere_revision_manual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    motivo_prioridad: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resumen_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
+    etiquetas_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transcripcion_audio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proveedor_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cliente_aprobada: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    cliente_aprobacion_observacion: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cliente_aprobacion_fecha: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    propuesta_expira_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     prioridad: Mapped[PrioridadSolicitud] = mapped_column(
         Enum(PrioridadSolicitud, name="prioridad_solicitud"),
         nullable=False,
@@ -41,3 +52,6 @@ class Solicitud(Base):
     tipo_incidente = relationship("TipoIncidente", back_populates="solicitudes", lazy="selectin")
     estado = relationship("EstadoSolicitud", back_populates="solicitudes", lazy="selectin")
     historial = relationship("HistorialEvento", back_populates="solicitud", cascade="all, delete-orphan")
+    evidencias = relationship("EvidenciaSolicitud", back_populates="solicitud", cascade="all, delete-orphan")
+    pagos = relationship("PagoSolicitud", back_populates="solicitud", cascade="all, delete-orphan")
+    disputas = relationship("DisputaSolicitud", back_populates="solicitud", cascade="all, delete-orphan")

@@ -4,9 +4,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.auth import get_current_user, get_role_names
+from app.models.device_tokens import UserDeviceToken
 from app.models.notificaciones import Notificacion
 from app.models.users import User
-from app.schemas.notificaciones import NotificacionResponse
+from app.schemas.notificaciones import DeviceTokenRegisterRequest, NotificacionResponse
 
 
 router = APIRouter(prefix="/notificaciones", tags=["Notificaciones"])
@@ -39,3 +40,28 @@ async def mark_notification_as_read(
     await db.commit()
     await db.refresh(notificacion)
     return notificacion
+
+
+@router.post("/device-token", status_code=status.HTTP_204_NO_CONTENT)
+async def register_device_token(
+    payload: DeviceTokenRegisterRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    existing = await db.scalar(
+        select(UserDeviceToken).where(
+            UserDeviceToken.user_id == current_user.id,
+            UserDeviceToken.token == payload.token,
+        )
+    )
+    if existing:
+        existing.plataforma = payload.plataforma
+    else:
+        db.add(
+            UserDeviceToken(
+                user_id=current_user.id,
+                token=payload.token,
+                plataforma=payload.plataforma,
+            )
+        )
+    await db.commit()

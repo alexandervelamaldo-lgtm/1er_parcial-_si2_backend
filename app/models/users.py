@@ -34,6 +34,8 @@ class User(Base):
     )
     cliente = relationship("Cliente", back_populates="user", uselist=False)
     tecnico = relationship("Tecnico", back_populates="user", uselist=False)
+    taller = relationship("Taller", back_populates="user", uselist=False)
     operador = relationship("Operador", back_populates="user", uselist=False)
     notificaciones = relationship("Notificacion", back_populates="usuario")
+    device_tokens = relationship("UserDeviceToken", back_populates="usuario", cascade="all, delete-orphan")
     eventos = relationship("HistorialEvento", back_populates="usuario")

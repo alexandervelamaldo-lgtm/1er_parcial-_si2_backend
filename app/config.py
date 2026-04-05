@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     maps_api_key: str = Field(default="", alias="MAPS_API_KEY")
     firebase_credentials: str = Field(default="", alias="FIREBASE_CREDENTIALS")
     fcm_project_id: str = Field(default="", alias="FCM_PROJECT_ID")
+    ai_provider: str = Field(default="mock", alias="AI_PROVIDER")
+    ai_http_endpoint: str = Field(default="", alias="AI_HTTP_ENDPOINT")
+    ai_api_key: str = Field(default="", alias="AI_API_KEY")
 
     model_config = SettingsConfigDict(
         env_file=".env",

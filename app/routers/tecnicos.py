@@ -1,10 +1,12 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.dependencies.auth import get_current_tecnico_id, get_current_user, get_role_names, require_roles
+from app.dependencies.auth import get_current_taller_id, get_current_tecnico_id, get_current_user, get_role_names, require_roles
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.schemas.tecnicos import (
@@ -19,21 +21,32 @@ from app.schemas.tecnicos import (
 router = APIRouter(prefix="/tecnicos", tags=["Técnicos"])
 
 
-def validate_technician_access(current_user: User, current_tecnico_id: int | None, tecnico_id: int) -> None:
+def validate_technician_access(
+    current_user: User,
+    current_tecnico_id: int | None,
+    current_taller_id: int | None,
+    tecnico: Tecnico,
+) -> None:
     roles = get_role_names(current_user)
     if roles.intersection({"ADMINISTRADOR", "OPERADOR"}):
         return
-    if "TECNICO" in roles and current_tecnico_id == tecnico_id:
+    if "TECNICO" in roles and current_tecnico_id == tecnico.id:
+        return
+    if "TALLER" in roles and current_taller_id is not None and tecnico.taller_id == current_taller_id:
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes administrar este técnico")
 
 
 @router.get("", response_model=list[TecnicoResponse])
 async def list_technicians(
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
+    current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> list[Tecnico]:
-    result = await db.execute(select(Tecnico).options(selectinload(Tecnico.user)))
+    query = select(Tecnico).options(selectinload(Tecnico.user))
+    if "TALLER" in get_role_names(current_user) and current_taller_id is not None:
+        query = query.where(Tecnico.taller_id == current_taller_id)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 
@@ -53,13 +66,16 @@ async def create_technician(
 @router.get("/{tecnico_id}", response_model=TecnicoResponse)
 async def get_technician(
     tecnico_id: int,
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
+    current_tecnico_id: int | None = Depends(get_current_tecnico_id),
+    current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> Tecnico:
     result = await db.execute(select(Tecnico).options(selectinload(Tecnico.user)).where(Tecnico.id == tecnico_id))
     tecnico = result.scalar_one_or_none()
     if not tecnico:
         raise HTTPException(status_code=404, detail="Técnico no encontrado")
+    validate_technician_access(current_user, current_tecnico_id, current_taller_id, tecnico)
     return tecnico
 
 
@@ -69,14 +85,17 @@ async def update_technician(
     payload: TecnicoUpdate,
     current_user: User = Depends(get_current_user),
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
+    current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> Tecnico:
-    validate_technician_access(current_user, current_tecnico_id, tecnico_id)
     tecnico = await db.get(Tecnico, tecnico_id)
     if not tecnico:
         raise HTTPException(status_code=404, detail="Técnico no encontrado")
+    validate_technician_access(current_user, current_tecnico_id, current_taller_id, tecnico)
 
     for field, value in payload.model_dump(exclude_unset=True).items():
+        if field == "taller_id" and "TALLER" in get_role_names(current_user) and value != current_taller_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes mover el técnico a otro taller")
         setattr(tecnico, field, value)
 
     await db.commit()
@@ -104,14 +123,16 @@ async def update_technician_location(
     payload: UbicacionTecnicoUpdate,
     current_user: User = Depends(get_current_user),
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
+    current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> Tecnico:
-    validate_technician_access(current_user, current_tecnico_id, tecnico_id)
     tecnico = await db.get(Tecnico, tecnico_id)
     if not tecnico:
         raise HTTPException(status_code=404, detail="Técnico no encontrado")
+    validate_technician_access(current_user, current_tecnico_id, current_taller_id, tecnico)
     tecnico.latitud_actual = payload.latitud_actual
     tecnico.longitud_actual = payload.longitud_actual
+    tecnico.ubicacion_actualizada_en = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(tecnico)
     return tecnico
@@ -123,12 +144,13 @@ async def update_technician_availability(
     payload: DisponibilidadTecnicoUpdate,
     current_user: User = Depends(get_current_user),
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
+    current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> Tecnico:
-    validate_technician_access(current_user, current_tecnico_id, tecnico_id)
     tecnico = await db.get(Tecnico, tecnico_id)
     if not tecnico:
         raise HTTPException(status_code=404, detail="Técnico no encontrado")
+    validate_technician_access(current_user, current_tecnico_id, current_taller_id, tecnico)
     tecnico.disponibilidad = payload.disponibilidad
     await db.commit()
     await db.refresh(tecnico)

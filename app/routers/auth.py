@@ -8,6 +8,7 @@ from app.dependencies.auth import get_current_user
 from app.models.clientes import Cliente
 from app.models.operadores import Operador
 from app.models.roles import Role
+from app.models.talleres import Taller
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.schemas.auth import (
@@ -15,6 +16,7 @@ from app.schemas.auth import (
     LoginRequest,
     PasswordChangeRequest,
     RegisterRequest,
+    RegisterWorkshopRequest,
     ResetPasswordRequest,
     TokenResponse,
 )
@@ -76,6 +78,38 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     return build_token_response(user)
 
 
+@router.post("/register-workshop", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def register_workshop(payload: RegisterWorkshopRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    existing_user = await db.scalar(select(User).where(User.email == payload.email))
+    if existing_user:
+        raise HTTPException(status_code=400, detail="El correo ya está registrado")
+    role = await db.scalar(select(Role).where(Role.name == "TALLER"))
+    if not role:
+        raise HTTPException(status_code=400, detail="Rol TALLER no configurado")
+
+    user = User(email=payload.email, password_hash=hash_password(payload.password))
+    user.roles.append(role)
+    db.add(user)
+    await db.flush()
+
+    taller = Taller(
+        user_id=user.id,
+        nombre=payload.nombre_taller,
+        direccion=payload.direccion,
+        latitud=payload.latitud,
+        longitud=payload.longitud,
+        telefono=payload.telefono,
+        capacidad=payload.capacidad,
+        servicios="|".join(payload.servicios),
+        disponible=True,
+        acepta_automaticamente=False,
+    )
+    db.add(taller)
+    await db.commit()
+    await db.refresh(user, attribute_names=["roles"])
+    return build_token_response(user)
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     user = await db.scalar(select(User).options(selectinload(User.roles)).where(User.email == payload.email))
@@ -110,11 +144,13 @@ async def get_my_profile(
     cliente_id = await db.scalar(select(Cliente.id).where(Cliente.user_id == current_user.id))
     tecnico_id = await db.scalar(select(Tecnico.id).where(Tecnico.user_id == current_user.id))
     operador_id = await db.scalar(select(Operador.id).where(Operador.user_id == current_user.id))
+    taller_id = await db.scalar(select(Taller.id).where(Taller.user_id == current_user.id))
     return CurrentUserProfileResponse(
         user=UserResponse.model_validate(current_user),
         cliente_id=cliente_id,
         tecnico_id=tecnico_id,
         operador_id=operador_id,
+        taller_id=taller_id,
     )
 
 

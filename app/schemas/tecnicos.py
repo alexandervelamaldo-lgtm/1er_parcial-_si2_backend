@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from app.schemas.users import UserResponse
@@ -7,6 +9,7 @@ class TecnicoBase(BaseModel):
     nombre: str = Field(min_length=3, max_length=150)
     telefono: str = Field(min_length=7, max_length=30)
     especialidad: str = Field(min_length=3, max_length=120)
+    taller_id: int | None = None
     latitud_actual: float | None = None
     longitud_actual: float | None = None
     disponibilidad: bool = True
@@ -14,6 +17,14 @@ class TecnicoBase(BaseModel):
 
 class TecnicoCreate(TecnicoBase):
     user_id: int
+
+
+class TecnicoWorkshopCreate(BaseModel):
+    email: str = Field(min_length=5, max_length=255)
+    password: str = Field(min_length=6, max_length=64)
+    nombre: str = Field(min_length=3, max_length=150)
+    telefono: str = Field(min_length=7, max_length=30)
+    especialidad: str = Field(min_length=3, max_length=120)
 
 
 class TecnicoUpdate(BaseModel):
@@ -37,6 +48,7 @@ class DisponibilidadTecnicoUpdate(BaseModel):
 class TecnicoResponse(TecnicoBase):
     id: int
     user_id: int
+    ubicacion_actualizada_en: datetime | None = None
     user: UserResponse | None = None
 
     model_config = {"from_attributes": True}

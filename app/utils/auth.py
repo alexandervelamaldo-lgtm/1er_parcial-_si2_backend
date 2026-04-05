@@ -7,8 +7,12 @@ from passlib.context import CryptContext
 from app.config import get_settings
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
 settings = get_settings()
+
+
+def _truncate_password_for_bcrypt(password: str) -> str:
+    return password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
 
 
 def hash_password(password: str) -> str:
@@ -16,7 +20,16 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except ValueError:
+        truncated_password = _truncate_password_for_bcrypt(plain_password)
+        if truncated_password != plain_password:
+            try:
+                return pwd_context.verify(truncated_password, hashed_password)
+            except ValueError:
+                return False
+        return False
 
 
 def create_access_token(subject: str, expires_minutes: int | None = None, extra: dict[str, Any] | None = None) -> str:

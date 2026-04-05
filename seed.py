@@ -4,7 +4,23 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 
 from app.database import AsyncSessionLocal
-from app.models import Cliente, EstadoSolicitud, HistorialEvento, Notificacion, Operador, Role, Solicitud, Taller, Tecnico, TipoIncidente, User, Vehiculo
+from app.models import (
+    Cliente,
+    DisputaSolicitud,
+    EstadoSolicitud,
+    EvidenciaSolicitud,
+    HistorialEvento,
+    Notificacion,
+    Operador,
+    PagoSolicitud,
+    Role,
+    Solicitud,
+    Taller,
+    Tecnico,
+    TipoIncidente,
+    User,
+    Vehiculo,
+)
 from app.models.enums import EstadoSolicitudEnum, NombreRol, PrioridadSolicitud
 from app.utils.auth import hash_password
 
@@ -20,7 +36,7 @@ INCIDENTES = [
 
 async def reset_tables() -> None:
     async with AsyncSessionLocal() as session:
-        for model in [HistorialEvento, Notificacion, Solicitud, Vehiculo, Taller, Tecnico, Operador, Cliente, User, Role, TipoIncidente, EstadoSolicitud]:
+        for model in [DisputaSolicitud, PagoSolicitud, EvidenciaSolicitud, HistorialEvento, Notificacion, Solicitud, Vehiculo, Taller, Tecnico, Operador, Cliente, User, Role, TipoIncidente, EstadoSolicitud]:
             await session.execute(delete(model))
         await session.commit()
 
@@ -46,6 +62,7 @@ async def seed() -> None:
             ("operador@emergency.com", NombreRol.OPERADOR.value),
             ("tecnico@emergency.com", NombreRol.TECNICO.value),
             ("cliente@emergency.com", NombreRol.CLIENTE.value),
+            ("taller@emergency.com", NombreRol.TALLER.value),
         ]:
             user = User(email=email, password_hash=hash_password("Password123*"))
             user.roles.append(roles[rol])
@@ -67,6 +84,12 @@ async def seed() -> None:
         for index in range(1, 4):
             user = User(email=f"tecnico{index}@emergency.com", password_hash=hash_password("Password123*"))
             user.roles.append(roles[NombreRol.TECNICO.value])
+            usuarios.append(user)
+            session.add(user)
+
+        for index in range(1, 3):
+            user = User(email=f"taller{index}@emergency.com", password_hash=hash_password("Password123*"))
+            user.roles.append(roles[NombreRol.TALLER.value])
             usuarios.append(user)
             session.add(user)
 
@@ -108,13 +131,17 @@ async def seed() -> None:
         for index, user in enumerate(operadores_users, start=1):
             session.add(Operador(user_id=user.id, nombre=f"Operador {index}", turno="Mixto"))
 
+        talleres_users = [u for u in usuarios if any(role.name == "TALLER" for role in u.roles)]
         talleres = [
-            Taller(nombre="Taller Centro", direccion="Av. Central 100", latitud=19.43, longitud=-99.13, telefono="5511111111", capacidad=8),
-            Taller(nombre="Taller Norte", direccion="Av. Norte 200", latitud=19.48, longitud=-99.12, telefono="5522222222", capacidad=6),
-            Taller(nombre="Taller Sur", direccion="Av. Sur 300", latitud=19.37, longitud=-99.16, telefono="5533333333", capacidad=5),
+            Taller(user_id=talleres_users[0].id if len(talleres_users) > 0 else None, nombre="Taller Centro", direccion="Av. Central 100", latitud=19.43, longitud=-99.13, telefono="5511111111", capacidad=8, servicios="grúa|batería|diagnóstico", disponible=True, acepta_automaticamente=False),
+            Taller(user_id=talleres_users[1].id if len(talleres_users) > 1 else None, nombre="Taller Norte", direccion="Av. Norte 200", latitud=19.48, longitud=-99.12, telefono="5522222222", capacidad=6, servicios="mecánica|combustible", disponible=True, acepta_automaticamente=True),
+            Taller(nombre="Taller Sur", direccion="Av. Sur 300", latitud=19.37, longitud=-99.16, telefono="5533333333", capacidad=5, servicios="llantas|grúa", disponible=True, acepta_automaticamente=False),
         ]
         session.add_all(talleres)
         await session.flush()
+
+        for index, tecnico in enumerate(tecnicos):
+            tecnico.taller_id = talleres[index % len(talleres)].id
 
         vehiculos: list[Vehiculo] = []
         for index in range(10):
@@ -152,6 +179,10 @@ async def seed() -> None:
                 longitud_incidente=cliente.longitud or -99.13,
                 descripcion=f"Solicitud de prueba #{index + 1}",
                 foto_url=f"https://picsum.photos/seed/{index}/400/300",
+                clasificacion_confianza=0.55 if index % 4 == 0 else 0.82,
+                requiere_revision_manual=index % 4 == 0,
+                motivo_prioridad="Seed de priorización",
+                resumen_ia="Clasificación generada para dataset de prueba",
                 prioridad=list(PrioridadSolicitud)[index % len(PrioridadSolicitud)],
                 fecha_solicitud=datetime.now(timezone.utc) - timedelta(hours=index),
                 fecha_asignacion=datetime.now(timezone.utc) - timedelta(hours=index - 1) if tecnico else None,
@@ -179,6 +210,39 @@ async def seed() -> None:
                     leida=index % 2 == 0,
                 )
             )
+            if estado.nombre == "COMPLETADA":
+                session.add(
+                    PagoSolicitud(
+                        solicitud_id=solicitud.id,
+                        cliente_id=cliente.id,
+                        taller_id=taller.id,
+                        monto_total=350.0 + index,
+                        monto_comision=35.0 + (index * 0.1),
+                        monto_taller=315.0 + (index * 0.9),
+                        metodo_pago="tarjeta",
+                        estado="PAGADO",
+                        fecha_pago=datetime.now(timezone.utc),
+                    )
+                )
+            if index % 5 == 0:
+                session.add(
+                    EvidenciaSolicitud(
+                        solicitud_id=solicitud.id,
+                        usuario_id=cliente.user_id,
+                        tipo="TEXT",
+                        contenido_texto="Evidencia textual de prueba",
+                    )
+                )
+            if index % 7 == 0:
+                session.add(
+                    DisputaSolicitud(
+                        solicitud_id=solicitud.id,
+                        usuario_id=cliente.user_id,
+                        motivo="Cobro",
+                        detalle="Revisión de cobro de prueba",
+                        estado="ABIERTA",
+                    )
+                )
 
         await session.commit()
 
