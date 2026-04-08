@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies.auth import get_current_taller_id, get_current_tecnico_id, get_current_user, get_role_names, require_roles
+from app.models.roles import Role
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.schemas.tecnicos import (
@@ -16,6 +17,7 @@ from app.schemas.tecnicos import (
     TecnicoUpdate,
     UbicacionTecnicoUpdate,
 )
+from app.utils.auth import hash_password
 
 
 router = APIRouter(prefix="/tecnicos", tags=["Técnicos"])
@@ -56,11 +58,52 @@ async def create_technician(
     _: User = Depends(require_roles("ADMINISTRADOR", "OPERADOR")),
     db: AsyncSession = Depends(get_db),
 ) -> Tecnico:
-    tecnico = Tecnico(**payload.model_dump())
+    role = await db.scalar(select(Role).where(Role.name == "TECNICO"))
+    if not role:
+        raise HTTPException(status_code=400, detail="Rol TECNICO no configurado")
+
+    user: User | None = None
+    if payload.user_id is not None:
+        user = await db.scalar(select(User).options(selectinload(User.roles)).where(User.id == payload.user_id))
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    else:
+        existing_user = await db.scalar(select(User).where(User.email == payload.email))
+        if existing_user:
+            raise HTTPException(status_code=400, detail="El correo ya está registrado")
+        user = User(email=str(payload.email), password_hash=hash_password(payload.password or ""))
+        user.roles.append(role)
+        db.add(user)
+        await db.flush()
+
+    existing_technician = await db.scalar(select(Tecnico).where(Tecnico.user_id == user.id))
+    if existing_technician:
+        raise HTTPException(status_code=400, detail="El usuario ya tiene un perfil técnico")
+
+    if all(item.name != "TECNICO" for item in user.roles):
+        user.roles.append(role)
+
+    tecnico = Tecnico(
+        user_id=user.id,
+        nombre=payload.nombre,
+        telefono=payload.telefono,
+        especialidad=payload.especialidad,
+        taller_id=payload.taller_id,
+        latitud_actual=payload.latitud_actual,
+        longitud_actual=payload.longitud_actual,
+        disponibilidad=payload.disponibilidad,
+    )
     db.add(tecnico)
     await db.commit()
-    await db.refresh(tecnico)
-    return tecnico
+    result = await db.execute(
+        select(Tecnico)
+        .options(selectinload(Tecnico.user).selectinload(User.roles))
+        .where(Tecnico.id == tecnico.id)
+    )
+    created_tecnico = result.scalar_one_or_none()
+    if not created_tecnico:
+        raise HTTPException(status_code=404, detail="Técnico no encontrado")
+    return created_tecnico
 
 
 @router.get("/{tecnico_id}", response_model=TecnicoResponse)

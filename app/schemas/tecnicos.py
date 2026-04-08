@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.schemas.users import UserResponse
 
@@ -16,7 +16,17 @@ class TecnicoBase(BaseModel):
 
 
 class TecnicoCreate(TecnicoBase):
-    user_id: int
+    user_id: int | None = None
+    email: EmailStr | None = None
+    password: str | None = Field(default=None, min_length=6, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_user_source(self) -> "TecnicoCreate":
+        if self.user_id is not None:
+            return self
+        if self.email and self.password:
+            return self
+        raise ValueError("Debes indicar un user_id existente o email y password para crear el acceso del técnico")
 
 
 class TecnicoWorkshopCreate(BaseModel):

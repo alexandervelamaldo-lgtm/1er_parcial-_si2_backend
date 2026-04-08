@@ -49,6 +49,7 @@ from app.schemas.solicitudes import (
     SolicitudSeguimientoResponse,
     TecnicoCandidatoResponse,
 )
+from app.schemas.tipos_incidente import TipoIncidenteResponse
 from app.services.payment_service import calculate_payment_breakdown
 from app.services.multimodal_ai_service import analyze_image_file, transcribe_audio_file
 from app.services.notificacion_service import enviar_notificacion_push
@@ -516,6 +517,15 @@ async def create_request(
     if not result:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     return result
+
+
+@router.get("/tipos-incidente", response_model=list[TipoIncidenteResponse])
+async def list_incident_types(
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TipoIncidente]:
+    result = await db.execute(select(TipoIncidente).order_by(TipoIncidente.id))
+    return list(result.scalars().all())
 
 
 @router.get("/estados", response_model=list[EstadoSolicitudOptionResponse])
