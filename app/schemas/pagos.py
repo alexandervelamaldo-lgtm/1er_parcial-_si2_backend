@@ -4,10 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class PagoCreate(BaseModel):
-    monto_total: float = Field(gt=0)
+    monto_total: float | None = Field(default=None, gt=0)
     metodo_pago: str = Field(min_length=3, max_length=40)
     referencia_externa: str | None = Field(default=None, max_length=120)
     observacion: str | None = Field(default=None, max_length=500)
+    confirmar_pago: bool = True
 
 
 class PagoResponse(BaseModel):

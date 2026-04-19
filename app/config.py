@@ -1,3 +1,4 @@
+import json
 from functools import lru_cache
 from typing import List
 
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
         alias="ACCESS_TOKEN_EXPIRE_MINUTES",
     )
     cors_origins: List[str] = Field(default_factory=lambda: ["*"], alias="CORS_ORIGINS")
+    cors_origin_regex: str = Field(default="", alias="CORS_ORIGIN_REGEX")
     app_env: str = Field(default="development", alias="APP_ENV")
     backend_base_url: str = Field(default="http://localhost:8000", alias="BACKEND_BASE_URL")
     maps_api_key: str = Field(default="", alias="MAPS_API_KEY")
@@ -33,6 +35,34 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    settings.database_url = _normalize_database_url(settings.database_url)
+    settings.cors_origins = _normalize_cors_origins(settings.cors_origins)
     if not settings.database_url or not settings.secret_key:
         raise RuntimeError("DATABASE_URL y SECRET_KEY son obligatorias")
     return settings
+
+
+def _normalize_database_url(database_url: str) -> str:
+    normalized = (database_url or "").strip()
+    if normalized.startswith("postgres://"):
+        return normalized.replace("postgres://", "postgresql+asyncpg://", 1)
+    if normalized.startswith("postgresql://") and "+asyncpg" not in normalized:
+        return normalized.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return normalized
+
+
+def _normalize_cors_origins(cors_origins: List[str] | str) -> List[str]:
+    if isinstance(cors_origins, list):
+        return cors_origins
+    raw = cors_origins.strip()
+    if not raw:
+        return ["*"]
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return [origin.strip() for origin in raw.split(",") if origin.strip()]
+        if isinstance(parsed, list):
+            return [str(origin).strip() for origin in parsed if str(origin).strip()]
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]

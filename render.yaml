@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: emergency-backend
+    env: docker
+    plan: starter
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
+      - key: APP_ENV
+        value: production
+      - key: BACKEND_BASE_URL
+        value: https://emergency-backend.onrender.com
+      - key: CORS_ORIGINS
+        value: '["http://localhost:4200"]'
+      - key: CORS_ORIGIN_REGEX
+        value: ^https://.*\.netlify\.app$
+      - key: AI_PROVIDER
+        value: mock

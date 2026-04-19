@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -111,10 +111,20 @@ async def register_workshop(payload: RegisterWorkshopRequest, db: AsyncSession =
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
     user = await db.scalar(select(User).options(selectinload(User.roles)).where(User.email == payload.email))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
+    client_platform = request.headers.get("x-client-platform", "").lower()
+    if client_platform == "web" and any(role.name == "CLIENTE" for role in user.roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Los clientes no pueden ingresar desde la web. Usa la aplicación móvil.",
+        )
     return build_token_response(user)
 
 

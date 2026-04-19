@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta, timezone
+import csv
+from io import StringIO
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import desc, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import Response
+from sqlalchemy import desc, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -30,6 +33,7 @@ from app.models.tecnicos import Tecnico
 from app.models.tipos_incidente import TipoIncidente
 from app.models.users import User
 from app.models.vehiculos import Vehiculo
+from app.models.roles import Role
 from app.schemas.disputas import DisputaCreate, DisputaResolverRequest, DisputaResponse
 from app.schemas.evidencias import EvidenciaResponse
 from app.schemas.historial_eventos import HistorialEventoResponse
@@ -47,15 +51,21 @@ from app.schemas.solicitudes import (
     SolicitudResponderAsignacionRequest,
     SolicitudResponse,
     SolicitudSeguimientoResponse,
+    SolicitudTrabajoFinalizadoRequest,
     TecnicoCandidatoResponse,
+    TrabajoRealizadoItemResponse,
+    TrabajoRealizadoListResponse,
+    TrabajoRealizadoResumenResponse,
 )
 from app.schemas.tipos_incidente import TipoIncidenteResponse
+from app.services.invoice_pdf_service import build_invoice_pdf, format_bs
 from app.services.payment_service import calculate_payment_breakdown
 from app.services.multimodal_ai_service import analyze_image_file, transcribe_audio_file
 from app.services.notificacion_service import enviar_notificacion_push
 from app.schemas.talleres import TallerResponse
 from app.services.prioridad_service import calcular_prioridad
-from app.services.triage_service import analyze_incident
+from app.services.triage_service import analyze_incident, estimate_repair_cost
+from app.utils.auth import get_subject_from_token
 from app.utils.geo import calcular_distancia_km
 
 
@@ -93,6 +103,13 @@ async def _get_operador_user_ids(db: AsyncSession) -> list[int]:
     return list(result.scalars().all())
 
 
+async def _get_admin_user_ids(db: AsyncSession) -> list[int]:
+    result = await db.execute(
+        select(User.id).join(User.roles).where(Role.name == "ADMINISTRADOR")
+    )
+    return list(result.scalars().all())
+
+
 def estimate_eta_minutes(distance_km: float) -> int:
     return max(5, round((distance_km / 35) * 60))
 
@@ -110,8 +127,6 @@ def can_transition_request(current_state: str, new_state: str, roles: set[str]) 
             return new_state == "EN_CAMINO"
         if current_state == "EN_CAMINO":
             return new_state == "EN_ATENCION"
-        if current_state == "EN_ATENCION":
-            return new_state == "COMPLETADA"
     return False
 
 
@@ -121,6 +136,8 @@ async def _load_request_with_relations(db: AsyncSession, solicitud_id: int) -> S
         .options(
             selectinload(Solicitud.estado),
             selectinload(Solicitud.tipo_incidente),
+            selectinload(Solicitud.cliente).selectinload(Cliente.user),
+            selectinload(Solicitud.vehiculo),
             selectinload(Solicitud.historial),
             selectinload(Solicitud.tecnico),
             selectinload(Solicitud.taller),
@@ -144,6 +161,167 @@ def _parse_ai_tags(tags: str | None) -> list[str]:
 def _merge_ai_tags(existing_tags: str | None, new_tags: list[str]) -> str | None:
     merged = sorted(set(_parse_ai_tags(existing_tags) + [tag for tag in new_tags if tag]))
     return "|".join(merged) if merged else None
+
+
+def _apply_cost_estimate(solicitud: Solicitud) -> None:
+    estimation = estimate_repair_cost(
+        tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
+        descripcion=solicitud.descripcion,
+        es_carretera=solicitud.es_carretera,
+        condicion_vehiculo=solicitud.condicion_vehiculo,
+        nivel_riesgo=solicitud.nivel_riesgo,
+        detected_tags=_parse_ai_tags(solicitud.etiquetas_ia),
+        clasificacion_confianza=solicitud.clasificacion_confianza,
+        requiere_revision_manual=solicitud.requiere_revision_manual,
+        prioridad=solicitud.prioridad.value,
+        transcripcion_audio=solicitud.transcripcion_audio,
+        resumen_ia=solicitud.resumen_ia,
+    )
+    solicitud.costo_estimado = estimation.amount
+    solicitud.costo_estimado_min = estimation.min_amount
+    solicitud.costo_estimado_max = estimation.max_amount
+    solicitud.costo_estimacion_confianza = estimation.confidence
+    solicitud.costo_estimacion_nota = estimation.note
+
+
+def _resolve_payment_amount(solicitud: Solicitud, requested_amount: float | None) -> float:
+    if solicitud.costo_final is not None:
+        final_amount = round(solicitud.costo_final, 2)
+        if requested_amount is not None and round(requested_amount, 2) != final_amount:
+            raise HTTPException(
+                status_code=400,
+                detail="El monto a pagar debe coincidir con el costo final registrado por el técnico.",
+            )
+        return final_amount
+    if requested_amount is not None:
+        return requested_amount
+    if solicitud.costo_estimado is not None:
+        return solicitud.costo_estimado
+    raise HTTPException(
+        status_code=400,
+        detail="No hay un monto estimado disponible. Indica un monto manual para registrar el pago.",
+    )
+
+
+async def _resolve_user_from_request(request: Request, db: AsyncSession) -> User:
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip() if auth_header.lower().startswith("bearer ") else ""
+    if not token:
+        token = request.query_params.get("access_token", "").strip()
+    email = get_subject_from_token(token)
+    if not email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
+    result = await db.execute(select(User).options(selectinload(User.roles)).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no autorizado")
+    return user
+
+
+def _get_latest_paid_payment(solicitud: Solicitud) -> PagoSolicitud | None:
+    paid_payments = [item for item in solicitud.pagos if item.estado == "PAGADO"]
+    if not paid_payments:
+        return None
+    return sorted(paid_payments, key=lambda item: item.fecha_pago or item.fecha_creacion, reverse=True)[0]
+
+
+def _parse_datetime_query(value: str | None, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    raw = value.strip()
+    parsed = datetime.fromisoformat(raw) if "T" in raw else datetime.fromisoformat(f"{raw}T00:00:00")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if end_of_day and "T" not in raw:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+async def _fetch_trabajos_realizados(
+    db: AsyncSession,
+    desde: str | None,
+    hasta: str | None,
+    tecnico_id: int | None,
+    taller_id: int | None,
+) -> TrabajoRealizadoListResponse:
+    start = _parse_datetime_query(desde, end_of_day=False)
+    end = _parse_datetime_query(hasta, end_of_day=True)
+
+    paid_exists = exists(
+        select(PagoSolicitud.id).where(
+            PagoSolicitud.solicitud_id == Solicitud.id,
+            PagoSolicitud.estado == "PAGADO",
+        )
+    )
+    query = (
+        select(Solicitud)
+        .options(
+            selectinload(Solicitud.tipo_incidente),
+            selectinload(Solicitud.estado),
+            selectinload(Solicitud.cliente),
+            selectinload(Solicitud.taller),
+            selectinload(Solicitud.tecnico),
+            selectinload(Solicitud.pagos),
+        )
+        .where(
+            Solicitud.trabajo_terminado.is_(True),
+            Solicitud.costo_final.is_not(None),
+            Solicitud.fecha_cierre.is_not(None),
+            paid_exists,
+        )
+        .order_by(desc(Solicitud.fecha_cierre))
+    )
+    if tecnico_id is not None:
+        query = query.where(Solicitud.tecnico_id == tecnico_id)
+    if taller_id is not None:
+        query = query.where(Solicitud.taller_id == taller_id)
+    if start is not None:
+        query = query.where(Solicitud.fecha_cierre >= start)
+    if end is not None:
+        query = query.where(Solicitud.fecha_cierre <= end)
+
+    result = await db.execute(query)
+    solicitudes = list(result.scalars().all())
+
+    items: list[TrabajoRealizadoItemResponse] = []
+    total_facturado = 0.0
+    total_comision = 0.0
+    total_taller = 0.0
+
+    for solicitud in solicitudes:
+        pago = _get_latest_paid_payment(solicitud)
+        if not pago:
+            continue
+        item = TrabajoRealizadoItemResponse(
+            solicitud_id=solicitud.id,
+            fecha_cierre=solicitud.fecha_cierre or datetime.now(timezone.utc),
+            cliente=(solicitud.cliente.nombre if solicitud.cliente else "Cliente"),
+            taller=(solicitud.taller.nombre if solicitud.taller else "Sin taller"),
+            tecnico=(solicitud.tecnico.nombre if solicitud.tecnico else "Sin tecnico"),
+            tipo_incidente=(solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente"),
+            costo_estimado=solicitud.costo_estimado,
+            costo_final=round(float(solicitud.costo_final or 0), 2),
+            monto_total=round(float(pago.monto_total or 0), 2),
+            monto_comision=round(float(pago.monto_comision or 0), 2),
+            monto_taller=round(float(pago.monto_taller or 0), 2),
+            metodo_pago=pago.metodo_pago,
+            estado_pago=pago.estado,
+        )
+        items.append(item)
+        total_facturado += item.monto_total
+        total_comision += item.monto_comision
+        total_taller += item.monto_taller
+
+    cantidad = len(items)
+    promedio = round(total_facturado / cantidad, 2) if cantidad else 0.0
+    resumen = TrabajoRealizadoResumenResponse(
+        cantidad_trabajos=cantidad,
+        total_facturado=round(total_facturado, 2),
+        total_comision=round(total_comision, 2),
+        total_taller=round(total_taller, 2),
+        promedio_por_trabajo=promedio,
+    )
+    return TrabajoRealizadoListResponse(items=items, resumen=resumen)
 
 
 def _is_client_approval_expired(solicitud: Solicitud) -> bool:
@@ -435,6 +613,9 @@ async def create_request(
         longitud_incidente=payload.longitud_incidente,
         descripcion=payload.descripcion,
         foto_url=payload.foto_url,
+        es_carretera=payload.es_carretera,
+        condicion_vehiculo=payload.condicion_vehiculo,
+        nivel_riesgo=payload.nivel_riesgo,
         clasificacion_confianza=triage.confidence,
         requiere_revision_manual=triage.requires_manual_review,
         motivo_prioridad=triage.reason,
@@ -443,6 +624,8 @@ async def create_request(
         proveedor_ia=triage.provider,
         prioridad=prioridad,
     )
+    solicitud.tipo_incidente = tipo_incidente
+    _apply_cost_estimate(solicitud)
     db.add(solicitud)
     await db.flush()
 
@@ -462,7 +645,8 @@ async def create_request(
             estado_nuevo=estado_registrada.nombre,
             observacion=(
                 f"Clasificación IA: {triage.summary}. Confianza {triage.confidence:.2f}. "
-                f"Etiquetas: {', '.join(triage.detected_tags) or 'sin etiquetas concluyentes'}"
+                f"Etiquetas: {', '.join(triage.detected_tags) or 'sin etiquetas concluyentes'}. "
+                f"Costo estimado aproximado: {format_bs(solicitud.costo_estimado)}"
             ),
             usuario_id=cliente.user_id,
         )
@@ -605,7 +789,7 @@ async def request_history(
     return list(result.scalars().all())
 
 
-@router.get("/{solicitud_id}", response_model=SolicitudResponse)
+@router.get("/{solicitud_id:int}", response_model=SolicitudResponse)
 async def get_request(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -621,7 +805,7 @@ async def get_request(
     return solicitud
 
 
-@router.get("/{solicitud_id}/detalle", response_model=SolicitudDetalleResponse)
+@router.get("/{solicitud_id:int}/detalle", response_model=SolicitudDetalleResponse)
 async def get_request_detail(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -645,7 +829,7 @@ async def get_request_detail(
     return SolicitudDetalleResponse(**detalle, historial=historial, evidencias=evidencias, pagos=pagos, disputas=disputas)
 
 
-@router.get("/{solicitud_id}/historial", response_model=list[HistorialEventoResponse])
+@router.get("/{solicitud_id:int}/historial", response_model=list[HistorialEventoResponse])
 async def get_request_timeline(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -661,7 +845,7 @@ async def get_request_timeline(
     return sorted(solicitud.historial, key=lambda item: item.fecha_evento, reverse=True)
 
 
-@router.get("/{solicitud_id}/candidatos", response_model=SolicitudCandidatosResponse)
+@router.get("/{solicitud_id:int}/candidatos", response_model=SolicitudCandidatosResponse)
 async def get_request_candidates(
     solicitud_id: int,
     radio_km: float = Query(default=25.0, gt=0, le=200),
@@ -694,7 +878,7 @@ async def get_request_candidates(
     )
 
 
-@router.get("/{solicitud_id}/seguimiento", response_model=SolicitudSeguimientoResponse)
+@router.get("/{solicitud_id:int}/seguimiento", response_model=SolicitudSeguimientoResponse)
 async def get_request_tracking(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -710,7 +894,7 @@ async def get_request_tracking(
     return _build_tracking_response(solicitud)
 
 
-@router.put("/{solicitud_id}/asignar", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/asignar", response_model=SolicitudResponse)
 async def assign_request(
     solicitud_id: int,
     payload: SolicitudAsignar,
@@ -762,7 +946,7 @@ async def assign_request(
             tecnico_anterior.disponibilidad = True
     if tecnico and taller and tecnico.taller_id and tecnico.taller_id != taller.id:
         raise HTTPException(status_code=400, detail="El técnico no pertenece al taller seleccionado")
-    solicitud.tecnico_id = payload.tecnico_id
+    solicitud.tecnico_id = tecnico.id if tecnico else None
     solicitud.taller_id = taller_id
     solicitud.estado_id = estado_asignada.id
     solicitud.fecha_asignacion = datetime.now(timezone.utc)
@@ -828,7 +1012,7 @@ async def assign_request(
     return result
 
 
-@router.put("/{solicitud_id}/respuesta-cliente", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/respuesta-cliente", response_model=SolicitudResponse)
 async def respond_client_assignment(
     solicitud_id: int,
     payload: SolicitudRespuestaClienteRequest,
@@ -933,7 +1117,7 @@ async def respond_client_assignment(
     return result
 
 
-@router.put("/{solicitud_id}/respuesta-taller", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/respuesta-taller", response_model=SolicitudResponse)
 async def respond_workshop_assignment(
     solicitud_id: int,
     payload: SolicitudResponderAsignacionRequest,
@@ -1024,7 +1208,7 @@ async def respond_workshop_assignment(
     return result
 
 
-@router.put("/{solicitud_id}/revision-manual", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/revision-manual", response_model=SolicitudResponse)
 async def review_request_manually(
     solicitud_id: int,
     payload: SolicitudRevisionManualRequest,
@@ -1040,13 +1224,17 @@ async def review_request_manually(
     solicitud.resumen_ia = payload.resumen_ia
     solicitud.motivo_prioridad = payload.motivo_prioridad
     solicitud.requiere_revision_manual = False
+    _apply_cost_estimate(solicitud)
     cliente = await db.get(Cliente, solicitud.cliente_id)
     db.add(
         HistorialEvento(
             solicitud_id=solicitud.id,
             estado_anterior=estado_actual.nombre if estado_actual else "SIN_ESTADO",
             estado_nuevo=estado_actual.nombre if estado_actual else "SIN_ESTADO",
-            observacion=f"Revisión manual completada. Prioridad final {payload.prioridad.value}",
+            observacion=(
+                f"Revisión manual completada. Prioridad final {payload.prioridad.value}. "
+                f"Costo estimado actualizado a {format_bs(solicitud.costo_estimado)}"
+            ),
             usuario_id=current_user.id,
         )
     )
@@ -1065,7 +1253,7 @@ async def review_request_manually(
     return result
 
 
-@router.put("/{solicitud_id}/responder-asignacion", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/responder-asignacion", response_model=SolicitudResponse)
 async def respond_assignment(
     solicitud_id: int,
     payload: SolicitudResponderAsignacionRequest,
@@ -1144,7 +1332,7 @@ async def respond_assignment(
     return result
 
 
-@router.put("/{solicitud_id}/cancelar", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/cancelar", response_model=SolicitudResponse)
 async def cancel_request(
     solicitud_id: int,
     payload: SolicitudCancelarRequest,
@@ -1201,7 +1389,7 @@ async def cancel_request(
     return result
 
 
-@router.get("/{solicitud_id}/evidencias", response_model=list[EvidenciaResponse])
+@router.get("/{solicitud_id:int}/evidencias", response_model=list[EvidenciaResponse])
 async def list_request_evidence(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -1217,7 +1405,7 @@ async def list_request_evidence(
     return sorted(solicitud.evidencias, key=lambda item: item.fecha_creacion, reverse=True)
 
 
-@router.post("/{solicitud_id}/evidencias/texto", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{solicitud_id:int}/evidencias/texto", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
 async def add_text_evidence(
     solicitud_id: int,
     contenido_texto: str = Form(...),
@@ -1238,24 +1426,32 @@ async def add_text_evidence(
         contenido_texto=contenido_texto.strip(),
     )
     merged_text = f"{solicitud.descripcion} {contenido_texto.strip()}".strip()
+    normalized_text = merged_text.lower()
+    if "carretera" in normalized_text:
+        solicitud.es_carretera = True
+    if any(keyword in normalized_text for keyword in ["inmovilizado", "no arranca"]):
+        solicitud.condicion_vehiculo = "Vehículo inmovilizado"
+    if any(keyword in normalized_text for keyword in ["choque", "colision", "colisión", "humo", "freno"]):
+        solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
     triage = analyze_incident(
         tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
         descripcion=merged_text,
-        es_carretera="carretera" in merged_text.lower(),
-        condicion_vehiculo="actualizado por evidencia textual",
-        nivel_riesgo=4 if solicitud.prioridad.value in {"ALTA", "CRITICA"} else 2,
+        es_carretera=solicitud.es_carretera,
+        condicion_vehiculo=solicitud.condicion_vehiculo,
+        nivel_riesgo=solicitud.nivel_riesgo,
     )
     solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, triage.confidence)
     solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, triage.detected_tags)
     if triage.requires_manual_review:
         solicitud.requiere_revision_manual = True
+    _apply_cost_estimate(solicitud)
     db.add(evidence)
     db.add(
         HistorialEvento(
             solicitud_id=solicitud.id,
             estado_anterior=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
             estado_nuevo=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
-            observacion="Se adjuntó evidencia textual y se actualizó el contexto del análisis IA",
+            observacion=f"Se adjuntó evidencia textual y se actualizó el costo estimado a {format_bs(solicitud.costo_estimado)}",
             usuario_id=current_user.id,
         )
     )
@@ -1264,7 +1460,7 @@ async def add_text_evidence(
     return evidence
 
 
-@router.post("/{solicitud_id}/evidencias/archivo", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{solicitud_id:int}/evidencias/archivo", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
 async def add_file_evidence(
     solicitud_id: int,
     archivo: UploadFile = File(...),
@@ -1299,21 +1495,61 @@ async def add_file_evidence(
     )
     db.add(evidence)
     if evidence_type == "AUDIO":
-        transcription = await transcribe_audio_file(archivo.filename or target_path.name, archivo.content_type, len(content))
-        audio_triage = analyze_incident(
-            tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
-            descripcion=f"{solicitud.descripcion} {transcription.transcript}".strip(),
-            es_carretera=False,
-            condicion_vehiculo="actualizado por audio del cliente",
-            nivel_riesgo=4 if solicitud.prioridad.value in {"ALTA", "CRITICA"} else 2,
-        )
-        solicitud.transcripcion_audio = transcription.transcript
-        solicitud.proveedor_ia = transcription.provider
-        solicitud.resumen_ia = audio_triage.summary
-        solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, transcription.confidence, audio_triage.confidence)
-        solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, audio_triage.detected_tags)
-        if transcription.confidence < 0.65 or audio_triage.requires_manual_review:
-            solicitud.requiere_revision_manual = True
+        try:
+            solicitud.transcripcion_audio_estado = "PROCESANDO"
+            transcription = await transcribe_audio_file(archivo.filename or target_path.name, archivo.content_type, len(content))
+            normalized_transcript = transcription.transcript.lower()
+            if "carretera" in normalized_transcript:
+                solicitud.es_carretera = True
+            if any(keyword in normalized_transcript for keyword in ["inmovilizado", "no arranca"]):
+                solicitud.condicion_vehiculo = "Vehículo inmovilizado"
+            if any(keyword in normalized_transcript for keyword in ["choque", "colision", "colisión", "humo", "freno"]):
+                solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
+            audio_triage = analyze_incident(
+                tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
+                descripcion=f"{solicitud.descripcion} {transcription.transcript}".strip(),
+                es_carretera=solicitud.es_carretera,
+                condicion_vehiculo=solicitud.condicion_vehiculo,
+                nivel_riesgo=solicitud.nivel_riesgo,
+            )
+            solicitud.transcripcion_audio = transcription.transcript
+            solicitud.transcripcion_audio_estado = "COMPLETADA"
+            solicitud.transcripcion_audio_error = None
+            solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
+            solicitud.proveedor_ia = transcription.provider
+            solicitud.resumen_ia = audio_triage.summary
+            solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, transcription.confidence, audio_triage.confidence)
+            solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, audio_triage.detected_tags)
+            if transcription.confidence < 0.65 or audio_triage.requires_manual_review:
+                solicitud.requiere_revision_manual = True
+
+            roles = set(get_role_names(current_user))
+            if "CLIENTE" in roles and solicitud.transcripcion_audio:
+                snippet = solicitud.transcripcion_audio.strip().replace("\n", " ")
+                if len(snippet) > 260:
+                    snippet = snippet[:260] + "..."
+                notify_ids = await _get_operador_user_ids(db)
+                notify_ids.extend(await _get_admin_user_ids(db))
+                await _notify_users(
+                    db,
+                    notify_ids,
+                    "Audio transcrito",
+                    f"Solicitud #{solicitud.id}: {snippet}",
+                    "AUDIO_TRANSCRITO",
+                )
+                db.add(
+                    HistorialEvento(
+                        solicitud_id=solicitud.id,
+                        estado_anterior=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
+                        estado_nuevo=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
+                        observacion="Audio recibido y transcrito automáticamente para operación.",
+                        usuario_id=current_user.id,
+                    )
+                )
+        except Exception as exc:
+            solicitud.transcripcion_audio_estado = "ERROR"
+            solicitud.transcripcion_audio_error = str(exc)[:500]
+            solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
     else:
         image_analysis = await analyze_image_file(
             archivo.filename or target_path.name,
@@ -1324,15 +1560,18 @@ async def add_file_evidence(
         solicitud.proveedor_ia = image_analysis.provider
         solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, image_analysis.confidence)
         solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, image_analysis.labels)
+        if "choque" in image_analysis.labels or "motor" in image_analysis.labels:
+            solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
         if image_analysis.confidence < 0.65:
             solicitud.requiere_revision_manual = True
+    _apply_cost_estimate(solicitud)
     db.add(
         HistorialEvento(
             solicitud_id=solicitud.id,
             estado_anterior=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
             estado_nuevo=solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO",
             observacion=(
-                f"Se adjuntó evidencia {evidence_type.lower()} y se actualizó el análisis IA"
+                f"Se adjuntó evidencia {evidence_type.lower()} y se actualizó el análisis IA y el costo estimado"
                 if evidence_type in {"AUDIO", "IMAGE"}
                 else f"Se adjuntó evidencia {evidence_type.lower()}"
             ),
@@ -1344,7 +1583,61 @@ async def add_file_evidence(
     return evidence
 
 
-@router.get("/{solicitud_id}/pagos", response_model=list[PagoResponse])
+@router.put("/{solicitud_id:int}/trabajo-finalizado", response_model=SolicitudResponse)
+async def finalize_request_work(
+    solicitud_id: int,
+    payload: SolicitudTrabajoFinalizadoRequest,
+    current_user: User = Depends(get_current_user),
+    current_tecnico_id: int | None = Depends(get_current_tecnico_id),
+    db: AsyncSession = Depends(get_db),
+) -> Solicitud:
+    solicitud = await _load_request_with_relations(db, solicitud_id)
+    if not solicitud:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    roles = get_role_names(current_user)
+    if "TECNICO" not in roles or solicitud.tecnico_id != current_tecnico_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo el técnico asignado puede cerrar el trabajo")
+    estado_actual = solicitud.estado.nombre if solicitud.estado else ""
+    if estado_actual != "EN_ATENCION":
+        raise HTTPException(status_code=400, detail="La solicitud debe estar en atención para cerrar el trabajo técnico")
+    if solicitud.trabajo_terminado:
+        raise HTTPException(status_code=400, detail="El trabajo técnico ya fue registrado como finalizado")
+
+    solicitud.trabajo_terminado = True
+    solicitud.trabajo_terminado_en = datetime.now(timezone.utc)
+    solicitud.trabajo_terminado_observacion = payload.observacion.strip()
+    solicitud.costo_final = round(payload.costo_final, 2)
+    solicitud.moneda_costo = "BOB"
+
+    db.add(
+        HistorialEvento(
+            solicitud_id=solicitud.id,
+            estado_anterior=estado_actual,
+            estado_nuevo=estado_actual,
+            observacion=f"Trabajo realizado. Costo final {format_bs(solicitud.costo_final)}. {payload.observacion.strip()}",
+            usuario_id=current_user.id,
+        )
+    )
+
+    notify_ids = await _get_operador_user_ids(db)
+    if solicitud.cliente and solicitud.cliente.user_id:
+        notify_ids.append(solicitud.cliente.user_id)
+    await _notify_users(
+        db,
+        notify_ids,
+        "Trabajo finalizado",
+        f"El técnico cerró el trabajo de la solicitud #{solicitud.id} con costo final {format_bs(solicitud.costo_final)}.",
+        "TRABAJO_FINALIZADO",
+    )
+    await db.commit()
+
+    result = await _load_request_with_relations(db, solicitud.id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    return result
+
+
+@router.get("/{solicitud_id:int}/pagos", response_model=list[PagoResponse])
 async def list_request_payments(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -1360,7 +1653,7 @@ async def list_request_payments(
     return sorted(solicitud.pagos, key=lambda item: item.fecha_creacion, reverse=True)
 
 
-@router.post("/{solicitud_id}/pago", response_model=PagoResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{solicitud_id:int}/pago", response_model=PagoResponse, status_code=status.HTTP_201_CREATED)
 async def create_request_payment(
     solicitud_id: int,
     payload: PagoCreate,
@@ -1376,34 +1669,79 @@ async def create_request_payment(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo el cliente propietario puede pagar esta solicitud")
     estado_actual = solicitud.estado.nombre if solicitud.estado else ""
     if estado_actual not in {"EN_ATENCION", "COMPLETADA"}:
-        raise HTTPException(status_code=400, detail="La solicitud aún no está lista para pago")
+        raise HTTPException(status_code=400, detail="La solicitud aún no está lista para registrar el pago")
+    if solicitud.cliente_aprobada is False:
+        raise HTTPException(status_code=400, detail="Primero debes aprobar la propuesta antes de registrar el pago")
+    if not solicitud.trabajo_terminado or solicitud.costo_final is None:
+        raise HTTPException(status_code=400, detail="El técnico aún debe registrar el trabajo realizado y el costo final en Bs")
     existing_paid = next((item for item in solicitud.pagos if item.estado == "PAGADO"), None)
     if existing_paid:
         raise HTTPException(status_code=400, detail="La solicitud ya tiene un pago confirmado")
-    breakdown = calculate_payment_breakdown(payload.monto_total)
-    pago = PagoSolicitud(
-        solicitud_id=solicitud.id,
-        cliente_id=solicitud.cliente_id,
-        taller_id=solicitud.taller_id,
-        monto_total=breakdown.total,
-        monto_comision=breakdown.commission,
-        monto_taller=breakdown.workshop_amount,
-        metodo_pago=payload.metodo_pago,
-        estado="PAGADO",
-        referencia_externa=payload.referencia_externa,
-        observacion=payload.observacion,
-        fecha_pago=datetime.now(timezone.utc),
+    monto_total = _resolve_payment_amount(solicitud, payload.monto_total)
+    breakdown = calculate_payment_breakdown(monto_total)
+    estado_pago = "PAGADO" if payload.confirmar_pago else "REGISTRADO"
+    pago = next(
+        (
+            item
+            for item in sorted(solicitud.pagos, key=lambda item: item.fecha_creacion, reverse=True)
+            if item.estado in {"PENDIENTE", "REGISTRADO"}
+        ),
+        None,
     )
-    db.add(pago)
+    if pago is None:
+        pago = PagoSolicitud(
+            solicitud_id=solicitud.id,
+            cliente_id=solicitud.cliente_id,
+            taller_id=solicitud.taller_id,
+            monto_total=breakdown.total,
+            monto_comision=breakdown.commission,
+            monto_taller=breakdown.workshop_amount,
+            metodo_pago=payload.metodo_pago,
+            estado=estado_pago,
+            referencia_externa=payload.referencia_externa,
+            observacion=payload.observacion,
+            fecha_pago=datetime.now(timezone.utc) if payload.confirmar_pago else None,
+        )
+        db.add(pago)
+    else:
+        pago.monto_total = breakdown.total
+        pago.monto_comision = breakdown.commission
+        pago.monto_taller = breakdown.workshop_amount
+        pago.metodo_pago = payload.metodo_pago
+        pago.estado = estado_pago
+        pago.referencia_externa = payload.referencia_externa
+        pago.observacion = payload.observacion
+        pago.fecha_pago = datetime.now(timezone.utc) if payload.confirmar_pago else None
     db.add(
         HistorialEvento(
             solicitud_id=solicitud.id,
             estado_anterior=estado_actual or "SIN_ESTADO",
             estado_nuevo=estado_actual or "SIN_ESTADO",
-            observacion=f"Pago registrado por {payload.monto_total:.2f} con comisión {breakdown.commission:.2f}",
+            observacion=(
+                f"Pago confirmado por {format_bs(breakdown.total)} con comisión {format_bs(breakdown.commission)}"
+                if payload.confirmar_pago
+                else f"Intención de pago registrada por {format_bs(breakdown.total)} mediante {payload.metodo_pago}"
+            ),
             usuario_id=current_user.id,
         )
     )
+    if payload.confirmar_pago and estado_actual != "COMPLETADA":
+        estado_completada = await _get_estado_por_nombre(db, "COMPLETADA")
+        solicitud.estado_id = estado_completada.id
+        solicitud.fecha_cierre = datetime.now(timezone.utc)
+        if solicitud.tecnico_id:
+            tecnico = await db.get(Tecnico, solicitud.tecnico_id)
+            if tecnico:
+                tecnico.disponibilidad = True
+        db.add(
+            HistorialEvento(
+                solicitud_id=solicitud.id,
+                estado_anterior=estado_actual or "SIN_ESTADO",
+                estado_nuevo=estado_completada.nombre,
+                observacion="Solicitud completada automaticamente tras la confirmacion del pago final.",
+                usuario_id=current_user.id,
+            )
+        )
     notify_ids = [current_user.id]
     if solicitud.taller and solicitud.taller.user_id:
         notify_ids.append(solicitud.taller.user_id)
@@ -1411,16 +1749,20 @@ async def create_request_payment(
     await _notify_users(
         db,
         notify_ids,
-        "Pago confirmado",
-        f"Se registró el pago de la solicitud #{solicitud.id}. Comisión plataforma: {breakdown.commission:.2f}.",
-        "PAGO_CONFIRMADO",
+        "Pago confirmado" if payload.confirmar_pago else "Pago registrado",
+        (
+            f"Se confirmó el pago de la solicitud #{solicitud.id} por {format_bs(breakdown.total)}. Comisión plataforma: {format_bs(breakdown.commission)}."
+            if payload.confirmar_pago
+            else f"El cliente registró intención de pago para la solicitud #{solicitud.id} por {format_bs(breakdown.total)}."
+        ),
+        "PAGO_CONFIRMADO" if payload.confirmar_pago else "PAGO_REGISTRADO",
     )
     await db.commit()
     await db.refresh(pago)
     return pago
 
 
-@router.get("/{solicitud_id}/disputas", response_model=list[DisputaResponse])
+@router.get("/{solicitud_id:int}/disputas", response_model=list[DisputaResponse])
 async def list_request_disputes(
     solicitud_id: int,
     current_user: User = Depends(get_current_user),
@@ -1436,7 +1778,238 @@ async def list_request_disputes(
     return sorted(solicitud.disputas, key=lambda item: item.fecha_creacion, reverse=True)
 
 
-@router.post("/{solicitud_id}/disputas", response_model=DisputaResponse, status_code=status.HTTP_201_CREATED)
+@router.get("/trabajos", response_model=TrabajoRealizadoListResponse)
+async def list_completed_jobs(
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
+    tecnico_id: int | None = Query(default=None),
+    taller_id: int | None = Query(default=None),
+    _: User = Depends(require_roles("ADMINISTRADOR", "OPERADOR", "TALLER")),
+    db: AsyncSession = Depends(get_db),
+) -> TrabajoRealizadoListResponse:
+    return await _fetch_trabajos_realizados(db, desde, hasta, tecnico_id, taller_id)
+
+
+@router.get("/trabajos.pdf")
+async def export_completed_jobs_pdf(
+    request: Request,
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
+    tecnico_id: int | None = Query(default=None),
+    taller_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await _resolve_user_from_request(request, db)
+    roles = set(get_role_names(user))
+    if not roles.intersection({"ADMINISTRADOR", "OPERADOR", "TALLER"}):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    data = await _fetch_trabajos_realizados(db, desde, hasta, tecnico_id, taller_id)
+    resumen = data.resumen
+
+    header = "ID | Fecha | Cliente | Taller | Tecnico | Total | Comision | Taller"
+    lines = [
+        f"Filtros: desde={desde or '-'} hasta={hasta or '-'} tecnico_id={tecnico_id or '-'} taller_id={taller_id or '-'}",
+        f"Cantidad: {resumen.cantidad_trabajos}",
+        f"Total facturado: {format_bs(resumen.total_facturado)}",
+        f"Total comision: {format_bs(resumen.total_comision)}",
+        f"Total taller: {format_bs(resumen.total_taller)}",
+        f"Promedio: {format_bs(resumen.promedio_por_trabajo)}",
+        "",
+        header,
+    ]
+    for item in data.items:
+        fecha = item.fecha_cierre.strftime("%Y-%m-%d")
+        lines.append(
+            f"{item.solicitud_id} | {fecha} | {item.cliente} | {item.taller} | {item.tecnico} | {format_bs(item.monto_total)} | {format_bs(item.monto_comision)} | {format_bs(item.monto_taller)}"
+        )
+
+    pdf_bytes = build_invoice_pdf(title="Reporte - Trabajos realizados", lines=lines)
+    filename = "trabajos_realizados.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/trabajos.csv")
+async def export_completed_jobs_csv(
+    request: Request,
+    desde: str | None = Query(default=None),
+    hasta: str | None = Query(default=None),
+    tecnico_id: int | None = Query(default=None),
+    taller_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await _resolve_user_from_request(request, db)
+    roles = set(get_role_names(user))
+    if not roles.intersection({"ADMINISTRADOR", "OPERADOR", "TALLER"}):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    data = await _fetch_trabajos_realizados(db, desde, hasta, tecnico_id, taller_id)
+
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "solicitud_id",
+            "fecha_cierre",
+            "cliente",
+            "taller",
+            "tecnico",
+            "tipo_incidente",
+            "costo_estimado",
+            "costo_final",
+            "monto_total",
+            "monto_comision",
+            "monto_taller",
+            "metodo_pago",
+            "estado_pago",
+        ]
+    )
+    for item in data.items:
+        writer.writerow(
+            [
+                item.solicitud_id,
+                item.fecha_cierre.isoformat(),
+                item.cliente,
+                item.taller,
+                item.tecnico,
+                item.tipo_incidente,
+                item.costo_estimado,
+                item.costo_final,
+                item.monto_total,
+                item.monto_comision,
+                item.monto_taller,
+                item.metodo_pago,
+                item.estado_pago,
+            ]
+        )
+    writer.writerow([])
+    writer.writerow(["cantidad_trabajos", data.resumen.cantidad_trabajos])
+    writer.writerow(["total_facturado", data.resumen.total_facturado])
+    writer.writerow(["total_comision", data.resumen.total_comision])
+    writer.writerow(["total_taller", data.resumen.total_taller])
+    writer.writerow(["promedio_por_trabajo", data.resumen.promedio_por_trabajo])
+
+    filename = "trabajos_realizados.csv"
+    return Response(
+        content=buffer.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.post("/{solicitud_id:int}/audio/transcribir", response_model=SolicitudResponse)
+async def retry_audio_transcription(
+    solicitud_id: int,
+    _: User = Depends(require_roles("ADMINISTRADOR", "OPERADOR")),
+    db: AsyncSession = Depends(get_db),
+) -> Solicitud:
+    solicitud = await _load_request_with_relations(db, solicitud_id)
+    if not solicitud:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+
+    audio_evidences = [item for item in solicitud.evidencias if item.tipo == "AUDIO"]
+    if not audio_evidences:
+        raise HTTPException(status_code=400, detail="No hay evidencia de audio para transcribir")
+    latest_audio = sorted(audio_evidences, key=lambda item: item.fecha_creacion, reverse=True)[0]
+
+    solicitud.transcripcion_audio_estado = "PROCESANDO"
+    solicitud.transcripcion_audio_error = None
+    solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
+
+    try:
+        transcription = await transcribe_audio_file(
+            latest_audio.nombre_archivo or Path(latest_audio.archivo_url or "").name,
+            latest_audio.mime_type,
+            latest_audio.tamano_bytes or 0,
+        )
+        solicitud.transcripcion_audio = transcription.transcript
+        solicitud.transcripcion_audio_estado = "COMPLETADA"
+        solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
+        solicitud.proveedor_ia = transcription.provider
+    except Exception as exc:
+        solicitud.transcripcion_audio_estado = "ERROR"
+        solicitud.transcripcion_audio_error = str(exc)[:500]
+        solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
+
+    await db.commit()
+    result = await _load_request_with_relations(db, solicitud.id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    return result
+
+
+@router.get("/{solicitud_id:int}/factura.pdf")
+async def download_invoice_pdf(
+    solicitud_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await _resolve_user_from_request(request, db)
+    solicitud = await _load_request_with_relations(db, solicitud_id)
+    if not solicitud:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    cliente_id = await db.scalar(select(Cliente.id).where(Cliente.user_id == user.id))
+    tecnico_id = await db.scalar(select(Tecnico.id).where(Tecnico.user_id == user.id))
+    taller_id = await db.scalar(select(Taller.id).where(Taller.user_id == user.id))
+    validate_request_access(user, cliente_id, tecnico_id, taller_id, solicitud)
+
+    paid = _get_latest_paid_payment(solicitud)
+    if not paid:
+        raise HTTPException(status_code=400, detail="No hay un pago confirmado para generar la factura")
+    if solicitud.costo_final is None:
+        raise HTTPException(status_code=400, detail="No hay un costo final registrado para generar la factura")
+
+    cliente_nombre = solicitud.cliente.nombre if solicitud.cliente else "Cliente"
+    placa = solicitud.vehiculo.placa if solicitud.vehiculo else "N/A"
+    taller_nombre = solicitud.taller.nombre if solicitud.taller else "Sin taller"
+    tecnico_nombre = solicitud.tecnico.nombre if solicitud.tecnico else "Sin tecnico"
+    estado_nombre = solicitud.estado.nombre if solicitud.estado else "SIN_ESTADO"
+    fecha = paid.fecha_pago or paid.fecha_creacion
+    fecha_str = fecha.strftime("%Y-%m-%d %H:%M") if fecha else ""
+
+    pdf_bytes = build_invoice_pdf(
+        title=f"Factura - Solicitud #{solicitud.id}",
+        lines=[
+            f"Fecha: {fecha_str}",
+            f"Cliente: {cliente_nombre}",
+            f"Vehiculo: {placa}",
+            f"Tipo: {solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else 'Incidente'}",
+            f"Taller: {taller_nombre}",
+            f"Tecnico: {tecnico_nombre}",
+            f"Estado: {estado_nombre}",
+            "",
+            f"Costo estimado IA: {format_bs(solicitud.costo_estimado)}",
+            f"Costo final tecnico: {format_bs(solicitud.costo_final)}",
+            "",
+            f"Pago confirmado: {format_bs(paid.monto_total)}",
+            f"Comision plataforma: {format_bs(paid.monto_comision)}",
+            f"Monto taller: {format_bs(paid.monto_taller)}",
+            f"Metodo: {paid.metodo_pago}",
+            f"Referencia: {paid.referencia_externa or 'N/A'}",
+        ],
+    )
+    filename = f"factura_solicitud_{solicitud.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.post("/{solicitud_id:int}/disputas", response_model=DisputaResponse, status_code=status.HTTP_201_CREATED)
 async def create_request_dispute(
     solicitud_id: int,
     payload: DisputaCreate,
@@ -1517,7 +2090,7 @@ async def resolve_request_dispute(
     return disputa
 
 
-@router.put("/{solicitud_id}/estado", response_model=SolicitudResponse)
+@router.put("/{solicitud_id:int}/estado", response_model=SolicitudResponse)
 async def update_request_status(
     solicitud_id: int,
     payload: SolicitudEstadoUpdate,
@@ -1541,6 +2114,11 @@ async def update_request_status(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"No se permite pasar de {estado_actual.nombre} a {nuevo_estado.nombre}",
+        )
+    if nuevo_estado.nombre == "COMPLETADA":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La solicitud se completa automáticamente solo después de confirmar el pago final.",
         )
     solicitud.estado_id = nuevo_estado.id
 

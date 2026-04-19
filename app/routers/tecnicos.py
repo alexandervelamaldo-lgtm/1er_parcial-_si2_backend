@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies.auth import get_current_taller_id, get_current_tecnico_id, get_current_user, get_role_names, require_roles
 from app.models.roles import Role
+from app.models.talleres import Taller
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.schemas.tecnicos import (
@@ -82,6 +83,13 @@ async def create_technician(
 
     if all(item.name != "TECNICO" for item in user.roles):
         user.roles.append(role)
+
+    if payload.taller_id is None:
+        raise HTTPException(status_code=400, detail="Debes asignar un taller al crear el técnico")
+
+    taller = await db.get(Taller, payload.taller_id)
+    if not taller:
+        raise HTTPException(status_code=404, detail="Taller no encontrado")
 
     tecnico = Tecnico(
         user_id=user.id,

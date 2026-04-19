@@ -5,7 +5,7 @@ from app.routers.solicitudes import can_transition_request, estimate_eta_minutes
 from app.services.multimodal_ai_service import analyze_image_file, transcribe_audio_file
 from app.services.payment_service import calculate_payment_breakdown
 from app.services.prioridad_service import calcular_prioridad
-from app.services.triage_service import analyze_incident
+from app.services.triage_service import analyze_incident, estimate_repair_cost
 
 
 def test_prioridad_critica_en_carretera_de_madrugada() -> None:
@@ -82,3 +82,35 @@ def test_desglose_de_pago_calcula_comision_plataforma() -> None:
     breakdown = calculate_payment_breakdown(500)
     assert breakdown.commission == 50
     assert breakdown.workshop_amount == 450
+
+
+def test_estimacion_de_costo_incrementa_para_incidente_grave() -> None:
+    estimate = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Choque con humo en carretera y posible daño de motor",
+        es_carretera=True,
+        condicion_vehiculo="Vehículo inmovilizado",
+        nivel_riesgo=5,
+        detected_tags=["choque", "motor"],
+        clasificacion_confianza=0.84,
+        prioridad="CRITICA",
+        resumen_ia="Atención prioritaria",
+    )
+    assert estimate.amount >= 1500
+    assert estimate.max_amount > estimate.min_amount
+    assert estimate.confidence >= 0.8
+
+
+def test_estimacion_de_costo_para_bateria_es_moderada() -> None:
+    estimate = estimate_repair_cost(
+        tipo_incidente="Batería descargada",
+        descripcion="El auto no arranca en el estacionamiento",
+        es_carretera=False,
+        condicion_vehiculo="No arranca",
+        nivel_riesgo=2,
+        detected_tags=["bateria"],
+        clasificacion_confianza=0.7,
+        prioridad="MEDIA",
+    )
+    assert 200 <= estimate.amount <= 700
+    assert "Señales consideradas" in estimate.note

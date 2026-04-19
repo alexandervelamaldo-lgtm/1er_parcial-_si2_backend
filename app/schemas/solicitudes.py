@@ -57,6 +57,11 @@ class SolicitudRevisionManualRequest(BaseModel):
     motivo_prioridad: str = Field(min_length=5, max_length=1000)
 
 
+class SolicitudTrabajoFinalizadoRequest(BaseModel):
+    costo_final: float = Field(gt=0)
+    observacion: str = Field(min_length=5, max_length=1000)
+
+
 class EstadoSolicitudOptionResponse(BaseModel):
     id: int
     nombre: str
@@ -115,13 +120,29 @@ class SolicitudResponse(BaseModel):
     longitud_incidente: float
     descripcion: str
     foto_url: str | None = None
+    es_carretera: bool = False
+    condicion_vehiculo: str
+    nivel_riesgo: int
     clasificacion_confianza: float | None = None
     requiere_revision_manual: bool = False
     motivo_prioridad: str | None = None
     resumen_ia: str | None = None
     etiquetas_ia: str | None = None
     transcripcion_audio: str | None = None
+    transcripcion_audio_estado: str | None = None
+    transcripcion_audio_error: str | None = None
+    transcripcion_audio_actualizada_en: datetime | None = None
     proveedor_ia: str | None = None
+    costo_estimado: float | None = None
+    costo_estimado_min: float | None = None
+    costo_estimado_max: float | None = None
+    costo_estimacion_confianza: float | None = None
+    costo_estimacion_nota: str | None = None
+    costo_final: float | None = None
+    moneda_costo: str = "BOB"
+    trabajo_terminado: bool = False
+    trabajo_terminado_en: datetime | None = None
+    trabajo_terminado_observacion: str | None = None
     cliente_aprobada: bool | None = None
     cliente_aprobacion_observacion: str | None = None
     cliente_aprobacion_fecha: datetime | None = None
@@ -142,3 +163,32 @@ class SolicitudDetalleResponse(SolicitudResponse):
     evidencias: list[EvidenciaResponse] = []
     pagos: list[PagoResponse] = []
     disputas: list[DisputaResponse] = []
+
+
+class TrabajoRealizadoItemResponse(BaseModel):
+    solicitud_id: int
+    fecha_cierre: datetime
+    cliente: str
+    taller: str
+    tecnico: str
+    tipo_incidente: str
+    costo_estimado: float | None = None
+    costo_final: float
+    monto_total: float
+    monto_comision: float
+    monto_taller: float
+    metodo_pago: str
+    estado_pago: str
+
+
+class TrabajoRealizadoResumenResponse(BaseModel):
+    cantidad_trabajos: int
+    total_facturado: float
+    total_comision: float
+    total_taller: float
+    promedio_por_trabajo: float
+
+
+class TrabajoRealizadoListResponse(BaseModel):
+    items: list[TrabajoRealizadoItemResponse]
+    resumen: TrabajoRealizadoResumenResponse

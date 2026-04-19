@@ -7,6 +7,7 @@ from app.routers import auth, clientes, mapa, notificaciones, solicitudes, talle
 
 
 settings = get_settings()
+allow_all_origins = settings.cors_origins == ["*"]
 app = FastAPI(
     title="Sistema Inteligente de Asistencia de Emergencia Vehicular",
     version="1.0.0",
@@ -17,7 +18,8 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins or ["*"],
-    allow_credentials=True,
+    allow_origin_regex=settings.cors_origin_regex or None,
+    allow_credentials=not allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

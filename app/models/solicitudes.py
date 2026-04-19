@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -21,13 +21,29 @@ class Solicitud(Base):
     longitud_incidente: Mapped[float] = mapped_column(Float, nullable=False)
     descripcion: Mapped[str] = mapped_column(Text, nullable=False)
     foto_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    es_carretera: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    condicion_vehiculo: Mapped[str] = mapped_column(Text, nullable=False, default="Operativo con limitaciones")
+    nivel_riesgo: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     clasificacion_confianza: Mapped[float | None] = mapped_column(Float, nullable=True)
     requiere_revision_manual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     motivo_prioridad: Mapped[str | None] = mapped_column(Text, nullable=True)
     resumen_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
     etiquetas_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
     transcripcion_audio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transcripcion_audio_estado: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transcripcion_audio_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    transcripcion_audio_actualizada_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     proveedor_ia: Mapped[str | None] = mapped_column(Text, nullable=True)
+    costo_estimado: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costo_estimado_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costo_estimado_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costo_estimacion_confianza: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costo_estimacion_nota: Mapped[str | None] = mapped_column(Text, nullable=True)
+    costo_final: Mapped[float | None] = mapped_column(Float, nullable=True)
+    moneda_costo: Mapped[str] = mapped_column(Text, nullable=False, default="BOB")
+    trabajo_terminado: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trabajo_terminado_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trabajo_terminado_observacion: Mapped[str | None] = mapped_column(Text, nullable=True)
     cliente_aprobada: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     cliente_aprobacion_observacion: Mapped[str | None] = mapped_column(Text, nullable=True)
     cliente_aprobacion_fecha: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

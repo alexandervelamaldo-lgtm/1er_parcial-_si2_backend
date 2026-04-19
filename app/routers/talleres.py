@@ -20,10 +20,27 @@ from app.utils.geo import calcular_distancia_km
 router = APIRouter(prefix="/talleres", tags=["Talleres"])
 
 
+def serialize_workshop(taller: Taller, distancia_km: float | None = None) -> TallerResponse:
+    return TallerResponse(
+        id=taller.id,
+        nombre=taller.nombre,
+        direccion=taller.direccion,
+        latitud=taller.latitud,
+        longitud=taller.longitud,
+        telefono=taller.telefono,
+        capacidad=taller.capacidad,
+        servicios=taller.servicios.split("|") if taller.servicios else [],
+        disponible=taller.disponible,
+        acepta_automaticamente=taller.acepta_automaticamente,
+        user_id=taller.user_id,
+        distancia_km=distancia_km,
+    )
+
+
 @router.get("", response_model=list[TallerResponse])
-async def list_workshops(db: AsyncSession = Depends(get_db)) -> list[Taller]:
+async def list_workshops(db: AsyncSession = Depends(get_db)) -> list[TallerResponse]:
     result = await db.execute(select(Taller).where(Taller.disponible.is_(True)))
-    return list(result.scalars().all())
+    return [serialize_workshop(taller) for taller in result.scalars().all()]
 
 
 @router.get("/cercanos", response_model=list[TallerResponse])
@@ -40,22 +57,7 @@ async def list_nearby_workshops(
     for taller in talleres:
         distancia = calcular_distancia_km(lat, lon, taller.latitud, taller.longitud)
         if distancia <= radio:
-            encontrados.append(
-                TallerResponse(
-                    id=taller.id,
-                    nombre=taller.nombre,
-                    direccion=taller.direccion,
-                    latitud=taller.latitud,
-                    longitud=taller.longitud,
-                    telefono=taller.telefono,
-                    capacidad=taller.capacidad,
-                    servicios=taller.servicios.split("|") if taller.servicios else [],
-                    disponible=taller.disponible,
-                    acepta_automaticamente=taller.acepta_automaticamente,
-                    user_id=taller.user_id,
-                    distancia_km=round(distancia, 2),
-                )
-            )
+            encontrados.append(serialize_workshop(taller, round(distancia, 2)))
     return sorted(encontrados, key=lambda item: item.distancia_km or 0)
 
 
@@ -64,13 +66,13 @@ async def get_my_workshop(
     current_taller_id: int | None = Depends(get_current_taller_id),
     _: User = Depends(require_roles("TALLER")),
     db: AsyncSession = Depends(get_db),
-) -> Taller:
+) -> TallerResponse:
     if current_taller_id is None:
         raise HTTPException(status_code=404, detail="No se encontró el taller autenticado")
     taller = await db.get(Taller, current_taller_id)
     if not taller:
         raise HTTPException(status_code=404, detail="Taller no encontrado")
-    return taller
+    return serialize_workshop(taller)
 
 
 @router.put("/mi-taller", response_model=TallerResponse)
@@ -79,7 +81,7 @@ async def update_my_workshop(
     current_taller_id: int | None = Depends(get_current_taller_id),
     _: User = Depends(require_roles("TALLER")),
     db: AsyncSession = Depends(get_db),
-) -> Taller:
+) -> TallerResponse:
     if current_taller_id is None:
         raise HTTPException(status_code=404, detail="No se encontró el taller autenticado")
     taller = await db.get(Taller, current_taller_id)
@@ -92,7 +94,7 @@ async def update_my_workshop(
         setattr(taller, field, value)
     await db.commit()
     await db.refresh(taller)
-    return taller
+    return serialize_workshop(taller)
 
 
 @router.get("/mi-taller/tecnicos", response_model=list[TecnicoResponse])
