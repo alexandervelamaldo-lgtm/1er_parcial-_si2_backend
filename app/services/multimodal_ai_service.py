@@ -30,6 +30,10 @@ class ImageAnalysisResult:
     summary: str
     confidence: float
     provider: str
+    components: list[str]
+    damage_zones: list[str]
+    severity: str
+    visual_factor: float
 
 
 @dataclass(slots=True)
@@ -39,12 +43,55 @@ class ExternalAIResult:
     summary: str | None = None
     confidence: float | None = None
     provider: str = "external-http"
+    components: list[str] | None = None
+    damage_zones: list[str] | None = None
+    severity: str | None = None
+    visual_factor: float | None = None
 
 
 def _extract_labels(*values: str) -> list[str]:
     normalized = " ".join(value.lower() for value in values if value)
     labels = [label for label, aliases in KEYWORD_MAP.items() if any(alias in normalized for alias in aliases)]
     return sorted(set(labels))
+
+
+def _extract_components_and_damage(*values: str) -> tuple[list[str], list[str], str, float]:
+    normalized = " ".join(value.lower() for value in values if value)
+    component_rules = {
+        "parachoques": ["parachoque", "paragolpe", "bumper"],
+        "faro": ["faro", "fanal", "luces"],
+        "capo": ["capo", "capó"],
+        "radiador": ["radiador"],
+        "llanta": ["llanta", "rueda", "neumatico", "neumático"],
+        "motor": ["motor", "humo", "aceite"],
+        "puerta": ["puerta"],
+        "lateral": ["lateral", "costado"],
+    }
+    components = sorted(
+        set(component for component, aliases in component_rules.items() if any(alias in normalized for alias in aliases))
+    )
+    zone_rules = {
+        "frontal": ["frontal", "frente", "choque frontal"],
+        "lateral": ["lateral", "costado"],
+        "trasera": ["trasera", "atras", "atrás", "posterior"],
+    }
+    damage_zones = sorted(set(zone for zone, aliases in zone_rules.items() if any(alias in normalized for alias in aliases)))
+
+    severity = "LEVE"
+    visual_factor = 1.03
+    if any(token in normalized for token in ["abolladura", "rayon", "rayón", "leve"]):
+        severity = "LEVE"
+        visual_factor = 1.05
+    if any(token in normalized for token in ["moderado", "parachoque", "faro roto", "lateral"]):
+        severity = "MODERADO"
+        visual_factor = 1.12
+    if any(token in normalized for token in ["severo", "airbag", "radiador", "estructural", "fuerte", "volcado"]):
+        severity = "SEVERO"
+        visual_factor = 1.28
+    if any(token in normalized for token in ["total", "irreparable", "pérdida total", "perdida total"]):
+        severity = "CRITICO"
+        visual_factor = 1.4
+    return components, damage_zones, severity, visual_factor
 
 
 async def _call_external_provider(kind: str, payload: dict[str, str | int | float]) -> ExternalAIResult | None:
@@ -70,6 +117,10 @@ async def _call_external_provider(kind: str, payload: dict[str, str | int | floa
         labels=list(data.get("labels", [])),
         summary=data.get("summary"),
         confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+        components=list(data.get("components", [])) if isinstance(data.get("components"), list) else None,
+        damage_zones=list(data.get("damage_zones", [])) if isinstance(data.get("damage_zones"), list) else None,
+        severity=data.get("severity"),
+        visual_factor=float(data["visual_factor"]) if data.get("visual_factor") is not None else None,
     )
 
 
@@ -118,12 +169,37 @@ async def analyze_image_file(
         labels = external.labels
         summary = external.summary or "Análisis de imagen completado"
         confidence = external.confidence or 0.8
-        return ImageAnalysisResult(labels=labels, summary=summary, confidence=confidence, provider=external.provider)
+        components = external.components or []
+        damage_zones = external.damage_zones or []
+        severity = external.severity or "MODERADO"
+        visual_factor = external.visual_factor or (1.22 if severity in {"SEVERO", "CRITICO"} else 1.12)
+        return ImageAnalysisResult(
+            labels=labels,
+            summary=summary,
+            confidence=confidence,
+            provider=external.provider,
+            components=components,
+            damage_zones=damage_zones,
+            severity=severity,
+            visual_factor=visual_factor,
+        )
     labels = _extract_labels(Path(file_name).stem, context)
+    components, damage_zones, severity, visual_factor = _extract_components_and_damage(Path(file_name).stem, context)
     summary = (
         f"La evidencia visual sugiere: {', '.join(labels)}."
         if labels
         else "La evidencia visual no aporta una clase concluyente."
     )
-    confidence = 0.73 if labels else 0.48
-    return ImageAnalysisResult(labels=labels, summary=summary, confidence=confidence, provider="mock")
+    if components:
+        summary = f"{summary} Componentes afectados: {', '.join(components)}. Severidad visual: {severity}."
+    confidence = 0.76 if labels or components else 0.48
+    return ImageAnalysisResult(
+        labels=labels,
+        summary=summary,
+        confidence=confidence,
+        provider="mock",
+        components=components,
+        damage_zones=damage_zones,
+        severity=severity,
+        visual_factor=visual_factor,
+    )

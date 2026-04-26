@@ -1,4 +1,5 @@
 import csv
+import json
 import mimetypes
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -175,7 +176,49 @@ def _region_hint_from_request(solicitud: Solicitud) -> str | None:
     return None
 
 
+def _parse_visual_signal_metadata(raw_value: str | None) -> dict | None:
+    if not raw_value:
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _collect_visual_signals(solicitud: Solicitud) -> list[dict]:
+    visual_signals: list[dict] = []
+    for evidence in solicitud.evidencias:
+        if evidence.tipo != "IMAGE":
+            continue
+        parsed = _parse_visual_signal_metadata(evidence.contenido_texto)
+        if parsed and parsed.get("status") == "OK":
+            visual_signals.append(parsed)
+    return visual_signals
+
+
+def _resolve_evidence_storage_path(evidence: EvidenciaSolicitud) -> Path | None:
+    backend_root = Path(__file__).resolve().parents[2]
+    storage_dir = EVIDENCE_STORAGE_DIR
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    if evidence.archivo_url:
+        candidate = (backend_root / evidence.archivo_url).resolve()
+        if str(candidate).lower().startswith(str(backend_root.resolve()).lower()) and candidate.is_file():
+            return candidate
+
+    suffix = Path(evidence.nombre_archivo or "").suffix
+    candidates: list[Path] = []
+    if evidence.solicitud_id:
+        pattern = f"solicitud_{evidence.solicitud_id}_*{suffix}" if suffix else f"solicitud_{evidence.solicitud_id}_*"
+        candidates.extend([item for item in storage_dir.glob(pattern) if item.is_file()])
+    if candidates:
+        return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[0]
+    return None
+
+
 def _apply_cost_estimate(solicitud: Solicitud) -> None:
+    visual_signals = _collect_visual_signals(solicitud)
     estimation = estimate_repair_cost(
         tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
         descripcion=solicitud.descripcion,
@@ -192,12 +235,17 @@ def _apply_cost_estimate(solicitud: Solicitud) -> None:
         vehiculo_modelo=solicitud.vehiculo.modelo if solicitud.vehiculo else None,
         vehiculo_anio=solicitud.vehiculo.anio if solicitud.vehiculo else None,
         region_hint=_region_hint_from_request(solicitud),
+        visual_signals=visual_signals,
     )
     solicitud.costo_estimado = estimation.amount
     solicitud.costo_estimado_min = estimation.min_amount
     solicitud.costo_estimado_max = estimation.max_amount
     solicitud.costo_estimacion_confianza = estimation.confidence
     solicitud.costo_estimacion_nota = estimation.note
+    solicitud.visual_tags = estimation.visual_tags
+    solicitud.visual_summary = estimation.visual_summary
+    solicitud.visual_factor = estimation.visual_factor
+    solicitud.visual_confidence = estimation.visual_confidence
     solicitud.requiere_revision_manual = solicitud.requiere_revision_manual or estimation.confidence < 0.65
 
 
@@ -846,6 +894,7 @@ async def get_request(
     if not solicitud:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     validate_request_access(current_user, current_cliente_id, current_tecnico_id, current_taller_id, solicitud)
+    _apply_cost_estimate(solicitud)
     return solicitud
 
 
@@ -862,6 +911,7 @@ async def get_request_detail(
     if not solicitud:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     validate_request_access(current_user, current_cliente_id, current_tecnico_id, current_taller_id, solicitud)
+    _apply_cost_estimate(solicitud)
     historial = [
         HistorialEventoResponse.model_validate(evento)
         for evento in sorted(solicitud.historial, key=lambda item: item.fecha_evento, reverse=True)
@@ -1625,7 +1675,7 @@ async def add_file_evidence(
 
             roles = set(get_role_names(current_user))
             if "CLIENTE" in roles and solicitud.transcripcion_audio:
-                snippet = solicitud.transcripcion_audio.strip().replace("\n", " ")
+                snippet = solicitud.transcripcion_audio.strip().replace("\n", " ") # type: ignore
                 if len(snippet) > 260:
                     snippet = snippet[:260] + "..."
                 notify_ids = await _get_operador_user_ids(db)
@@ -1651,20 +1701,40 @@ async def add_file_evidence(
             solicitud.transcripcion_audio_error = str(exc)[:500]
             solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
     else:
-        image_analysis = await analyze_image_file(
-            archivo.filename or target_path.name,
-            archivo.content_type,
-            f"{solicitud.descripcion} {solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else ''}",
-            file_bytes=content,
-        )
-        solicitud.resumen_ia = image_analysis.summary
-        solicitud.proveedor_ia = image_analysis.provider
-        solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, image_analysis.confidence)
-        solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, image_analysis.labels)
-        if "choque" in image_analysis.labels or "motor" in image_analysis.labels:
-            solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
-        if image_analysis.confidence < 0.65:
-            solicitud.requiere_revision_manual = True
+        try:
+            image_analysis = await analyze_image_file(
+                archivo.filename or target_path.name,
+                archivo.content_type,
+                f"{solicitud.descripcion} {solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else ''}",
+                file_bytes=content,
+            )
+            evidence.contenido_texto = json.dumps(
+                {
+                    "status": "OK",
+                    "labels": image_analysis.labels,
+                    "summary": image_analysis.summary,
+                    "confidence": image_analysis.confidence,
+                    "provider": image_analysis.provider,
+                    "components": image_analysis.components,
+                    "damage_zones": image_analysis.damage_zones,
+                    "severity": image_analysis.severity,
+                    "visual_factor": image_analysis.visual_factor,
+                },
+                ensure_ascii=False,
+            )
+            solicitud.resumen_ia = image_analysis.summary
+            solicitud.proveedor_ia = image_analysis.provider
+            solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, image_analysis.confidence)
+            solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, image_analysis.labels)
+            if "choque" in image_analysis.labels or "motor" in image_analysis.labels:
+                solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
+            if image_analysis.confidence < 0.65:
+                solicitud.requiere_revision_manual = True
+        except Exception as exc:
+            evidence.contenido_texto = json.dumps(
+                {"status": "ERROR", "error": str(exc)[:500]},
+                ensure_ascii=False,
+            )
     _apply_cost_estimate(solicitud)
     db.add(
         HistorialEvento(
@@ -2050,6 +2120,80 @@ async def retry_audio_transcription(
         solicitud.transcripcion_audio_error = str(exc)[:500]
         solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
 
+    await db.commit()
+    result = await _load_request_with_relations(db, solicitud.id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    return result
+
+
+@router.post("/{solicitud_id:int}/imagenes/reprocesar", response_model=SolicitudResponse)
+async def retry_image_analysis(
+    solicitud_id: int,
+    _: User = Depends(require_roles("ADMINISTRADOR", "OPERADOR")),
+    db: AsyncSession = Depends(get_db),
+) -> Solicitud:
+    solicitud = await _load_request_with_relations(db, solicitud_id)
+    if not solicitud:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+
+    image_evidences = [item for item in solicitud.evidencias if item.tipo == "IMAGE"]
+    if not image_evidences:
+        raise HTTPException(status_code=400, detail="No hay evidencias de imagen para reprocesar")
+
+    processed = 0
+    failed = 0
+    best_visual_factor = 0.0
+    best_summary: str | None = None
+    for evidence in sorted(image_evidences, key=lambda item: item.fecha_creacion, reverse=True):
+        try:
+            resolved_path = _resolve_evidence_storage_path(evidence)
+            if not resolved_path:
+                raise FileNotFoundError("Archivo de evidencia no disponible")
+            content = resolved_path.read_bytes()
+            image_analysis = await analyze_image_file(
+                evidence.nombre_archivo or resolved_path.name,
+                evidence.mime_type,
+                f"{solicitud.descripcion} {solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else ''}",
+                file_bytes=content,
+            )
+            evidence.contenido_texto = json.dumps(
+                {
+                    "status": "OK",
+                    "labels": image_analysis.labels,
+                    "summary": image_analysis.summary,
+                    "confidence": image_analysis.confidence,
+                    "provider": image_analysis.provider,
+                    "components": image_analysis.components,
+                    "damage_zones": image_analysis.damage_zones,
+                    "severity": image_analysis.severity,
+                    "visual_factor": image_analysis.visual_factor,
+                },
+                ensure_ascii=False,
+            )
+            solicitud.proveedor_ia = image_analysis.provider
+            solicitud.clasificacion_confianza = max(solicitud.clasificacion_confianza or 0, image_analysis.confidence)
+            solicitud.etiquetas_ia = _merge_ai_tags(solicitud.etiquetas_ia, image_analysis.labels)
+            if image_analysis.visual_factor > best_visual_factor:
+                best_visual_factor = image_analysis.visual_factor
+                best_summary = image_analysis.summary
+            if "choque" in image_analysis.labels or "motor" in image_analysis.labels:
+                solicitud.nivel_riesgo = max(solicitud.nivel_riesgo, 4)
+            if image_analysis.confidence < 0.65:
+                solicitud.requiere_revision_manual = True
+            processed += 1
+        except Exception as exc:
+            evidence.contenido_texto = json.dumps({"status": "ERROR", "error": str(exc)[:500]}, ensure_ascii=False)
+            failed += 1
+
+    if processed == 0:
+        raise HTTPException(status_code=400, detail="No se pudo reprocesar ninguna imagen")
+    if best_summary:
+        solicitud.resumen_ia = best_summary
+    if failed > 0:
+        solicitud.requiere_revision_manual = True
+
+    _apply_cost_estimate(solicitud)
     await db.commit()
     result = await _load_request_with_relations(db, solicitud.id)
     if not result:

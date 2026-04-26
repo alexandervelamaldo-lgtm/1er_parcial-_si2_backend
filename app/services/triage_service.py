@@ -18,6 +18,10 @@ class CostEstimateResult:
     max_amount: float
     confidence: float
     note: str
+    visual_tags: list[str]
+    visual_summary: str | None
+    visual_factor: float
+    visual_confidence: float
 
 
 BOLIVIA_BASE_COST_BS = {
@@ -166,6 +170,7 @@ def estimate_repair_cost(
     vehiculo_modelo: str | None = None,
     vehiculo_anio: int | None = None,
     region_hint: str | None = None,
+    visual_signals: list[dict] | None = None,
 ) -> CostEstimateResult:
     normalized_type = tipo_incidente.strip().lower()
     normalized_description = descripcion.strip().lower()
@@ -255,7 +260,48 @@ def estimate_repair_cost(
         evidence_factor *= 1.04
     evidence_factor = min(1.65, max(0.88, evidence_factor))
 
-    total = base_amount * antiguedad_factor * complejidad_factor * severidad_factor * region_factor * evidence_factor
+    visual_entries = [item for item in (visual_signals or []) if isinstance(item, dict)]
+    visual_tags: list[str] = sorted(
+        set(
+            tag
+            for item in visual_entries
+            for tag in (item.get("labels", []) if isinstance(item.get("labels"), list) else [])
+            if isinstance(tag, str) and tag
+        )
+    )
+    visual_components: list[str] = sorted(
+        set(
+            component
+            for item in visual_entries
+            for component in (item.get("components", []) if isinstance(item.get("components"), list) else [])
+            if isinstance(component, str) and component
+        )
+    )
+    visual_conf_values = [
+        float(item.get("confidence"))
+        for item in visual_entries
+        if item.get("confidence") is not None and isinstance(item.get("confidence"), (int, float))
+    ]
+    visual_factor_values = [
+        float(item.get("visual_factor"))
+        for item in visual_entries
+        if item.get("visual_factor") is not None and isinstance(item.get("visual_factor"), (int, float))
+    ]
+    severity_rank = {"LEVE": 1, "MODERADO": 2, "SEVERO": 3, "CRITICO": 4}
+    severity_max = "LEVE"
+    for item in visual_entries:
+        raw = str(item.get("severity", "LEVE")).upper()
+        if severity_rank.get(raw, 1) > severity_rank.get(severity_max, 1):
+            severity_max = raw
+    visual_factor = max(1.0, max(visual_factor_values) if visual_factor_values else 1.0)
+    if severity_max == "SEVERO":
+        visual_factor = max(visual_factor, 1.22)
+    elif severity_max == "CRITICO":
+        visual_factor = max(visual_factor, 1.35)
+    visual_factor = min(1.7, visual_factor)
+    visual_confidence = round(sum(visual_conf_values) / len(visual_conf_values), 2) if visual_conf_values else 0.0
+
+    total = base_amount * antiguedad_factor * complejidad_factor * severidad_factor * region_factor * evidence_factor * visual_factor
     if "volc" in full_text:
         total *= 1.15
     if "pérdida total" in full_text or "perdida total" in full_text:
@@ -290,6 +336,12 @@ def estimate_repair_cost(
         evidence_quality += 0.08
     elif not tags:
         evidence_quality -= 0.06
+    if visual_entries:
+        evidence_quality += min(0.12, 0.04 * len(visual_entries))
+    if visual_confidence >= 0.75:
+        evidence_quality += 0.06
+    elif visual_entries:
+        evidence_quality += 0.02
 
     confidence_base = clasificacion_confianza if clasificacion_confianza is not None else 0.6
     confidence = (confidence_base * 0.3) + (data_completeness * 0.3) + (consistency * 0.2) + (evidence_quality * 0.2)
@@ -316,12 +368,20 @@ def estimate_repair_cost(
         f"f_severidad={round(severidad_factor, 3)} (riesgo={nivel_riesgo}, prioridad={(prioridad or 'MEDIA').upper()})",
         f"f_region={region_factor} ({selected_region})",
         f"f_evidencia={round(evidence_factor, 3)}",
+        f"f_evidencia_visual={round(visual_factor, 3)}",
         f"margen={round(margin, 3)} por confianza={confidence}",
     ]
     if tags:
         note_parts.append(f"Señales consideradas: {', '.join(tags)}")
     if requiere_revision_manual:
         note_parts.append("Penalización por revisión manual pendiente")
+    visual_summary = None
+    if visual_entries:
+        visual_summary = (
+            f"Imágenes analizadas={len(visual_entries)} | severidad máxima={severity_max} | "
+            f"componentes={', '.join(visual_components) if visual_components else 'sin detalle'}"
+        )
+        note_parts.append(visual_summary)
     note_parts.append("Estimación referencial para mercado boliviano; sujeta a inspección técnica final")
 
     return CostEstimateResult(
@@ -330,4 +390,8 @@ def estimate_repair_cost(
         max_amount=float(max_amount),
         confidence=confidence,
         note=". ".join(note_parts),
+        visual_tags=visual_tags,
+        visual_summary=visual_summary,
+        visual_factor=float(round(visual_factor, 3)),
+        visual_confidence=float(visual_confidence),
     )

@@ -174,3 +174,66 @@ def test_estimacion_bolivia_refleja_complejidad_por_marca() -> None:
         detected_tags=["choque"],
     )
     assert estimate_premium.amount > estimate_economic.amount
+
+
+def test_estimacion_multimodal_aumenta_con_evidencia_visual_severa() -> None:
+    without_visual = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Choque lateral",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="ALTA",
+        vehiculo_marca="Toyota",
+        vehiculo_modelo="Corolla",
+        vehiculo_anio=2018,
+        region_hint="Santa Cruz",
+        detected_tags=["choque"],
+    )
+    with_visual = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Choque lateral",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="ALTA",
+        vehiculo_marca="Toyota",
+        vehiculo_modelo="Corolla",
+        vehiculo_anio=2018,
+        region_hint="Santa Cruz",
+        detected_tags=["choque"],
+        visual_signals=[
+            {
+                "labels": ["choque", "motor"],
+                "components": ["parachoques", "faro", "radiador"],
+                "severity": "SEVERO",
+                "visual_factor": 1.28,
+                "confidence": 0.83,
+            }
+        ],
+    )
+    assert with_visual.amount > without_visual.amount
+    assert with_visual.visual_factor >= 1.22
+    assert with_visual.visual_confidence >= 0.8
+
+
+def test_estimacion_multimodal_agrega_multiples_imagenes_por_severidad_maxima() -> None:
+    estimate = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Golpe frontal y lateral",
+        es_carretera=True,
+        condicion_vehiculo="Vehículo inmovilizado",
+        nivel_riesgo=4,
+        prioridad="CRITICA",
+        vehiculo_marca="BMW",
+        vehiculo_modelo="X3",
+        vehiculo_anio=2021,
+        region_hint="Santa Cruz",
+        detected_tags=["choque"],
+        visual_signals=[
+            {"labels": ["choque"], "components": ["faro"], "severity": "MODERADO", "visual_factor": 1.12, "confidence": 0.71},
+            {"labels": ["choque", "motor"], "components": ["radiador", "capo"], "severity": "CRITICO", "visual_factor": 1.4, "confidence": 0.88},
+        ],
+    )
+    assert estimate.visual_factor >= 1.35
+    assert "Imágenes analizadas=2" in estimate.note

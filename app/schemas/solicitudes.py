@@ -138,6 +138,10 @@ class SolicitudResponse(BaseModel):
     costo_estimado_max: float | None = None
     costo_estimacion_confianza: float | None = None
     costo_estimacion_nota: str | None = None
+    visual_tags: list[str] = []
+    visual_summary: str | None = None
+    visual_factor: float | None = None
+    visual_confidence: float | None = None
     costo_final: float | None = None
     moneda_costo: str = "BOB"
     trabajo_terminado: bool = False
