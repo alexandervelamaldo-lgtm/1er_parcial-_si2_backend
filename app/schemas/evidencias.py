@@ -15,6 +15,7 @@ class EvidenciaResponse(BaseModel):
     nombre_archivo: str | None = None
     contenido_texto: str | None = None
     archivo_url: str | None = None
+    url: str | None = None
     mime_type: str | None = None
     tamano_bytes: int | None = None
     fecha_creacion: datetime

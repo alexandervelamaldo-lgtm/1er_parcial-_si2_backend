@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import base64
 from pathlib import Path
 
 import httpx
@@ -72,10 +73,18 @@ async def _call_external_provider(kind: str, payload: dict[str, str | int | floa
     )
 
 
-async def transcribe_audio_file(file_name: str, mime_type: str | None, size_bytes: int) -> AudioTranscriptionResult:
+async def transcribe_audio_file(
+    file_name: str,
+    mime_type: str | None,
+    size_bytes: int,
+    file_bytes: bytes | None = None,
+) -> AudioTranscriptionResult:
+    payload: dict[str, str | int | float] = {"file_name": file_name, "mime_type": mime_type or "", "size_bytes": size_bytes}
+    if file_bytes:
+        payload["file_base64"] = base64.b64encode(file_bytes).decode("ascii")
     external = await _call_external_provider(
         "transcribe",
-        {"file_name": file_name, "mime_type": mime_type or "", "size_bytes": size_bytes},
+        payload,
     )
     if external and external.transcript:
         return AudioTranscriptionResult(
@@ -92,10 +101,18 @@ async def transcribe_audio_file(file_name: str, mime_type: str | None, size_byte
     return AudioTranscriptionResult(transcript=transcript, confidence=0.58 if labels else 0.42, provider="mock")
 
 
-async def analyze_image_file(file_name: str, mime_type: str | None, context: str) -> ImageAnalysisResult:
+async def analyze_image_file(
+    file_name: str,
+    mime_type: str | None,
+    context: str,
+    file_bytes: bytes | None = None,
+) -> ImageAnalysisResult:
+    payload: dict[str, str | int | float] = {"file_name": file_name, "mime_type": mime_type or "", "context": context}
+    if file_bytes:
+        payload["file_base64"] = base64.b64encode(file_bytes).decode("ascii")
     external = await _call_external_provider(
         "vision",
-        {"file_name": file_name, "mime_type": mime_type or "", "context": context},
+        payload,
     )
     if external and external.labels is not None:
         labels = external.labels

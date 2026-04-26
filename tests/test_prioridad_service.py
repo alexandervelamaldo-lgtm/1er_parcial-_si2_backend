@@ -114,3 +114,63 @@ def test_estimacion_de_costo_para_bateria_es_moderada() -> None:
     )
     assert 200 <= estimate.amount <= 700
     assert "Señales consideradas" in estimate.note
+
+
+def test_estimacion_bolivia_sube_para_vehiculo_antiguo() -> None:
+    estimate_old = estimate_repair_cost(
+        tipo_incidente="Falla mecánica",
+        descripcion="Motor con vibración y humo",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="MEDIA",
+        vehiculo_marca="Toyota",
+        vehiculo_modelo="Corolla",
+        vehiculo_anio=2008,
+        region_hint="La Paz",
+        detected_tags=["motor"],
+    )
+    estimate_new = estimate_repair_cost(
+        tipo_incidente="Falla mecánica",
+        descripcion="Motor con vibración y humo",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="MEDIA",
+        vehiculo_marca="Toyota",
+        vehiculo_modelo="Corolla",
+        vehiculo_anio=2023,
+        region_hint="La Paz",
+        detected_tags=["motor"],
+    )
+    assert estimate_old.amount > estimate_new.amount
+
+
+def test_estimacion_bolivia_refleja_complejidad_por_marca() -> None:
+    estimate_economic = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Colisión frontal leve",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="ALTA",
+        vehiculo_marca="Suzuki",
+        vehiculo_modelo="Swift",
+        vehiculo_anio=2018,
+        region_hint="Cochabamba",
+        detected_tags=["choque"],
+    )
+    estimate_premium = estimate_repair_cost(
+        tipo_incidente="Accidente",
+        descripcion="Colisión frontal leve",
+        es_carretera=False,
+        condicion_vehiculo="Operativo con limitaciones",
+        nivel_riesgo=3,
+        prioridad="ALTA",
+        vehiculo_marca="BMW",
+        vehiculo_modelo="X3",
+        vehiculo_anio=2018,
+        region_hint="Cochabamba",
+        detected_tags=["choque"],
+    )
+    assert estimate_premium.amount > estimate_economic.amount

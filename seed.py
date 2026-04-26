@@ -101,17 +101,17 @@ async def seed() -> None:
                 nombre=f"Cliente {index}",
                 telefono=f"55123456{index:02d}",
                 direccion=f"Dirección cliente {index}, Ciudad de México",
-                latitud=19.4326 + (index * 0.01),
-                longitud=-99.1332 - (index * 0.01),
+                latitud=-17.7833 + (index * 0.004),
+                longitud=-63.1821 + (index * 0.004),
             )
             clientes.append(cliente)
             session.add(cliente)
 
         tecnicos_data = [
-            ("Técnico Norte", 19.482, -99.13, "Mecánica rápida"),
-            ("Técnico Centro", 19.4326, -99.1332, "Grúa y batería"),
-            ("Técnico Sur", 19.372, -99.15, "Diagnóstico electrónico"),
-            ("Técnico Extra", 19.41, -99.11, "Asistencia general"),
+            ("Técnico Norte", -17.7446, -63.1678, "Mecánica rápida"),
+            ("Técnico Centro", -17.7833, -63.1821, "Grúa y batería"),
+            ("Técnico Sur", -17.8279, -63.1862, "Diagnóstico electrónico"),
+            ("Técnico Extra", -17.8024, -63.1467, "Asistencia general"),
         ]
         tecnicos_users = [u for u in usuarios if any(role.name == "TECNICO" for role in u.roles)]
         for user, (nombre, lat, lon, especialidad) in zip(tecnicos_users, tecnicos_data, strict=False):
@@ -133,9 +133,9 @@ async def seed() -> None:
 
         talleres_users = [u for u in usuarios if any(role.name == "TALLER" for role in u.roles)]
         talleres = [
-            Taller(user_id=talleres_users[0].id if len(talleres_users) > 0 else None, nombre="Taller Centro", direccion="Av. Central 100", latitud=19.43, longitud=-99.13, telefono="5511111111", capacidad=8, servicios="grúa|batería|diagnóstico", disponible=True, acepta_automaticamente=False),
-            Taller(user_id=talleres_users[1].id if len(talleres_users) > 1 else None, nombre="Taller Norte", direccion="Av. Norte 200", latitud=19.48, longitud=-99.12, telefono="5522222222", capacidad=6, servicios="mecánica|combustible", disponible=True, acepta_automaticamente=True),
-            Taller(nombre="Taller Sur", direccion="Av. Sur 300", latitud=19.37, longitud=-99.16, telefono="5533333333", capacidad=5, servicios="llantas|grúa", disponible=True, acepta_automaticamente=False),
+            Taller(user_id=talleres_users[0].id if len(talleres_users) > 0 else None, nombre="Taller Centro", direccion="Av. Central 100", latitud=-17.7836, longitud=-63.1822, telefono="5511111111", capacidad=8, servicios="grúa|batería|diagnóstico", disponible=True, acepta_automaticamente=False),
+            Taller(user_id=talleres_users[1].id if len(talleres_users) > 1 else None, nombre="Taller Norte", direccion="Av. Norte 200", latitud=-17.7487, longitud=-63.1698, telefono="5522222222", capacidad=6, servicios="mecánica|combustible", disponible=True, acepta_automaticamente=True),
+            Taller(nombre="Taller Sur", direccion="Av. Sur 300", latitud=-17.821, longitud=-63.1881, telefono="5533333333", capacidad=5, servicios="llantas|grúa", disponible=True, acepta_automaticamente=False),
         ]
         session.add_all(talleres)
         await session.flush()
@@ -175,8 +175,8 @@ async def seed() -> None:
                 taller_id=taller.id,
                 tipo_incidente_id=tipo_values[index % len(tipo_values)].id,
                 estado_id=estado.id,
-                latitud_incidente=cliente.latitud or 19.43,
-                longitud_incidente=cliente.longitud or -99.13,
+                latitud_incidente=cliente.latitud or -17.7833,
+                longitud_incidente=cliente.longitud or -63.1821,
                 descripcion=f"Solicitud de prueba #{index + 1}",
                 foto_url=f"https://picsum.photos/seed/{index}/400/300",
                 clasificacion_confianza=0.55 if index % 4 == 0 else 0.82,

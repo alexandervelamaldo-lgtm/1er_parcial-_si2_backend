@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta, timezone
 import csv
+import mimetypes
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import desc, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -163,6 +164,17 @@ def _merge_ai_tags(existing_tags: str | None, new_tags: list[str]) -> str | None
     return "|".join(merged) if merged else None
 
 
+def _region_hint_from_request(solicitud: Solicitud) -> str | None:
+    candidates = [
+        (solicitud.cliente.direccion if solicitud.cliente else None),
+        solicitud.descripcion,
+    ]
+    for raw in candidates:
+        if raw and raw.strip():
+            return raw.strip()
+    return None
+
+
 def _apply_cost_estimate(solicitud: Solicitud) -> None:
     estimation = estimate_repair_cost(
         tipo_incidente=solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else "Incidente",
@@ -176,12 +188,17 @@ def _apply_cost_estimate(solicitud: Solicitud) -> None:
         prioridad=solicitud.prioridad.value,
         transcripcion_audio=solicitud.transcripcion_audio,
         resumen_ia=solicitud.resumen_ia,
+        vehiculo_marca=solicitud.vehiculo.marca if solicitud.vehiculo else None,
+        vehiculo_modelo=solicitud.vehiculo.modelo if solicitud.vehiculo else None,
+        vehiculo_anio=solicitud.vehiculo.anio if solicitud.vehiculo else None,
+        region_hint=_region_hint_from_request(solicitud),
     )
     solicitud.costo_estimado = estimation.amount
     solicitud.costo_estimado_min = estimation.min_amount
     solicitud.costo_estimado_max = estimation.max_amount
     solicitud.costo_estimacion_confianza = estimation.confidence
     solicitud.costo_estimacion_nota = estimation.note
+    solicitud.requiere_revision_manual = solicitud.requiere_revision_manual or estimation.confidence < 0.65
 
 
 def _resolve_payment_amount(solicitud: Solicitud, requested_amount: float | None) -> float:
@@ -216,6 +233,33 @@ async def _resolve_user_from_request(request: Request, db: AsyncSession) -> User
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no autorizado")
     return user
+
+
+def _build_evidence_api_path(evidence_id: int) -> str:
+    return f"/solicitudes/evidencias/{evidence_id}/archivo"
+
+
+async def _resolve_actor_ids(db: AsyncSession, user: User) -> tuple[int | None, int | None, int | None]:
+    roles = get_role_names(user)
+    cliente_id: int | None = None
+    tecnico_id: int | None = None
+    taller_id: int | None = None
+
+    if "CLIENTE" in roles:
+        cliente_id = await db.scalar(select(Cliente.id).where(Cliente.user_id == user.id))
+    if "TECNICO" in roles:
+        tecnico_id = await db.scalar(select(Tecnico.id).where(Tecnico.user_id == user.id))
+    if "TALLER" in roles:
+        taller_id = await db.scalar(select(Taller.id).where(Taller.user_id == user.id))
+
+    return cliente_id, tecnico_id, taller_id
+
+
+def _evidence_to_response(evidence: EvidenciaSolicitud) -> EvidenciaResponse:
+    base = EvidenciaResponse.model_validate(evidence)
+    if evidence.tipo in {"IMAGE", "AUDIO"}:
+        return base.model_copy(update={"url": _build_evidence_api_path(evidence.id)})
+    return base
 
 
 def _get_latest_paid_payment(solicitud: Solicitud) -> PagoSolicitud | None:
@@ -823,7 +867,7 @@ async def get_request_detail(
         for evento in sorted(solicitud.historial, key=lambda item: item.fecha_evento, reverse=True)
     ]
     detalle = SolicitudResponse.model_validate(solicitud).model_dump()
-    evidencias = [EvidenciaResponse.model_validate(item) for item in sorted(solicitud.evidencias, key=lambda item: item.fecha_creacion, reverse=True)]
+    evidencias = [_evidence_to_response(item) for item in sorted(solicitud.evidencias, key=lambda item: item.fecha_creacion, reverse=True)]
     pagos = [PagoResponse.model_validate(item) for item in sorted(solicitud.pagos, key=lambda item: item.fecha_creacion, reverse=True)]
     disputas = [DisputaResponse.model_validate(item) for item in sorted(solicitud.disputas, key=lambda item: item.fecha_creacion, reverse=True)]
     return SolicitudDetalleResponse(**detalle, historial=historial, evidencias=evidencias, pagos=pagos, disputas=disputas)
@@ -1389,6 +1433,54 @@ async def cancel_request(
     return result
 
 
+@router.get("/evidencias/{evidence_id:int}/archivo")
+async def get_evidence_file(
+    evidence_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    current_user = await _resolve_user_from_request(request, db)
+    current_cliente_id, current_tecnico_id, current_taller_id = await _resolve_actor_ids(db, current_user)
+
+    result = await db.execute(
+        select(EvidenciaSolicitud).options(selectinload(EvidenciaSolicitud.solicitud)).where(EvidenciaSolicitud.id == evidence_id)
+    )
+    evidence = result.scalar_one_or_none()
+    if not evidence or evidence.tipo == "TEXT":
+        raise HTTPException(status_code=404, detail="Evidencia no encontrada")
+    if not evidence.solicitud:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+
+    validate_request_access(current_user, current_cliente_id, current_tecnico_id, current_taller_id, evidence.solicitud)
+
+    backend_root = Path(__file__).resolve().parents[2]
+    storage_dir = EVIDENCE_STORAGE_DIR
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_path: Path | None = None
+    if evidence.archivo_url:
+        candidate = (backend_root / evidence.archivo_url).resolve()
+        if str(candidate).lower().startswith(str(backend_root.resolve()).lower()) and candidate.is_file():
+            resolved_path = candidate
+    if not resolved_path:
+        suffix = Path(evidence.nombre_archivo or "").suffix
+        candidates: list[Path] = []
+        if evidence.solicitud_id:
+            pattern = f"solicitud_{evidence.solicitud_id}_*{suffix}" if suffix else f"solicitud_{evidence.solicitud_id}_*"
+            candidates.extend([item for item in storage_dir.glob(pattern) if item.is_file()])
+        if candidates:
+            resolved_path = sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[0]
+
+    if not resolved_path or not resolved_path.is_file():
+        raise HTTPException(status_code=404, detail="Archivo de evidencia no disponible")
+
+    media_type = evidence.mime_type or mimetypes.guess_type(resolved_path.name)[0] or "application/octet-stream"
+    if evidence.tipo == "IMAGE":
+        return FileResponse(str(resolved_path), media_type=media_type)
+    filename = evidence.nombre_archivo or resolved_path.name
+    return FileResponse(str(resolved_path), media_type=media_type, filename=filename)
+
+
 @router.get("/{solicitud_id:int}/evidencias", response_model=list[EvidenciaResponse])
 async def list_request_evidence(
     solicitud_id: int,
@@ -1397,12 +1489,12 @@ async def list_request_evidence(
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
     current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
-) -> list[EvidenciaSolicitud]:
+) -> list[EvidenciaResponse]:
     solicitud = await _load_request_with_relations(db, solicitud_id)
     if not solicitud:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     validate_request_access(current_user, current_cliente_id, current_tecnico_id, current_taller_id, solicitud)
-    return sorted(solicitud.evidencias, key=lambda item: item.fecha_creacion, reverse=True)
+    return [_evidence_to_response(item) for item in sorted(solicitud.evidencias, key=lambda item: item.fecha_creacion, reverse=True)]
 
 
 @router.post("/{solicitud_id:int}/evidencias/texto", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
@@ -1414,7 +1506,7 @@ async def add_text_evidence(
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
     current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
-) -> EvidenciaSolicitud:
+) -> EvidenciaResponse:
     solicitud = await _load_request_with_relations(db, solicitud_id)
     if not solicitud:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
@@ -1457,7 +1549,7 @@ async def add_text_evidence(
     )
     await db.commit()
     await db.refresh(evidence)
-    return evidence
+    return _evidence_to_response(evidence)
 
 
 @router.post("/{solicitud_id:int}/evidencias/archivo", response_model=EvidenciaResponse, status_code=status.HTTP_201_CREATED)
@@ -1469,7 +1561,7 @@ async def add_file_evidence(
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
     current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
-) -> EvidenciaSolicitud:
+) -> EvidenciaResponse:
     solicitud = await _load_request_with_relations(db, solicitud_id)
     if not solicitud:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
@@ -1483,7 +1575,10 @@ async def add_file_evidence(
     extension = Path(archivo.filename or "evidencia").suffix
     target_path = EVIDENCE_STORAGE_DIR / f"solicitud_{solicitud.id}_{int(datetime.now(timezone.utc).timestamp())}{extension}"
     target_path.write_bytes(content)
-    evidence_type = "AUDIO" if (archivo.content_type or "").startswith("audio/") else "IMAGE"
+    content_type = (archivo.content_type or "").lower()
+    extension = Path(archivo.filename or "").suffix.lower()
+    audio_extensions = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".mp4", ".webm"}
+    evidence_type = "AUDIO" if content_type.startswith("audio/") or extension in audio_extensions else "IMAGE"
     evidence = EvidenciaSolicitud(
         solicitud_id=solicitud.id,
         usuario_id=current_user.id,
@@ -1497,7 +1592,12 @@ async def add_file_evidence(
     if evidence_type == "AUDIO":
         try:
             solicitud.transcripcion_audio_estado = "PROCESANDO"
-            transcription = await transcribe_audio_file(archivo.filename or target_path.name, archivo.content_type, len(content))
+            transcription = await transcribe_audio_file(
+                archivo.filename or target_path.name,
+                archivo.content_type,
+                len(content),
+                file_bytes=content,
+            )
             normalized_transcript = transcription.transcript.lower()
             if "carretera" in normalized_transcript:
                 solicitud.es_carretera = True
@@ -1555,6 +1655,7 @@ async def add_file_evidence(
             archivo.filename or target_path.name,
             archivo.content_type,
             f"{solicitud.descripcion} {solicitud.tipo_incidente.nombre if solicitud.tipo_incidente else ''}",
+            file_bytes=content,
         )
         solicitud.resumen_ia = image_analysis.summary
         solicitud.proveedor_ia = image_analysis.provider
@@ -1580,7 +1681,7 @@ async def add_file_evidence(
     )
     await db.commit()
     await db.refresh(evidence)
-    return evidence
+    return _evidence_to_response(evidence)
 
 
 @router.put("/{solicitud_id:int}/trabajo-finalizado", response_model=SolicitudResponse)
@@ -1927,15 +2028,23 @@ async def retry_audio_transcription(
     solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
 
     try:
+        file_bytes: bytes | None = None
+        if latest_audio.archivo_url:
+            backend_root = Path(__file__).resolve().parents[2]
+            candidate = (backend_root / latest_audio.archivo_url).resolve()
+            if str(candidate).lower().startswith(str(backend_root.resolve()).lower()) and candidate.is_file():
+                file_bytes = candidate.read_bytes()
         transcription = await transcribe_audio_file(
             latest_audio.nombre_archivo or Path(latest_audio.archivo_url or "").name,
             latest_audio.mime_type,
             latest_audio.tamano_bytes or 0,
+            file_bytes=file_bytes,
         )
         solicitud.transcripcion_audio = transcription.transcript
         solicitud.transcripcion_audio_estado = "COMPLETADA"
         solicitud.transcripcion_audio_actualizada_en = datetime.now(timezone.utc)
         solicitud.proveedor_ia = transcription.provider
+        _apply_cost_estimate(solicitud)
     except Exception as exc:
         solicitud.transcripcion_audio_estado = "ERROR"
         solicitud.transcripcion_audio_error = str(exc)[:500]
