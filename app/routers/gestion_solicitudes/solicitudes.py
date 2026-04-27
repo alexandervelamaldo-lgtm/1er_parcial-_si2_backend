@@ -36,11 +36,10 @@ from app.models.tipos_incidente import TipoIncidente
 from app.models.users import User
 from app.models.vehiculos import Vehiculo
 from app.models.roles import Role
-from app.schemas.disputas import DisputaCreate, DisputaResolverRequest, DisputaResponse
-from app.schemas.evidencias import EvidenciaResponse
-from app.schemas.historial_eventos import HistorialEventoResponse
-from app.schemas.pagos import PagoCreate, PagoResponse
-from app.schemas.solicitudes import (
+from app.schemas.gestion_solicitudes.disputas import DisputaCreate, DisputaResolverRequest, DisputaResponse
+from app.schemas.gestion_solicitudes.evidencias import EvidenciaResponse
+from app.schemas.gestion_solicitudes.historial_eventos import HistorialEventoResponse
+from app.schemas.gestion_solicitudes.solicitudes import (
     EstadoSolicitudOptionResponse,
     SolicitudAsignar,
     SolicitudCancelarRequest,
@@ -59,14 +58,15 @@ from app.schemas.solicitudes import (
     TrabajoRealizadoListResponse,
     TrabajoRealizadoResumenResponse,
 )
-from app.schemas.tipos_incidente import TipoIncidenteResponse
-from app.services.invoice_pdf_service import build_invoice_pdf, format_bs
-from app.services.payment_service import calculate_payment_breakdown
-from app.services.multimodal_ai_service import analyze_image_file, transcribe_audio_file
-from app.services.notificacion_service import enviar_notificacion_push
-from app.schemas.talleres import TallerResponse
-from app.services.prioridad_service import calcular_prioridad
-from app.services.triage_service import analyze_incident, estimate_repair_cost
+from app.schemas.gestion_solicitudes.tipos_incidente import TipoIncidenteResponse
+from app.schemas.gestion_operativa_web.talleres import TallerResponse
+from app.schemas.pagos_facturacion.pagos import PagoCreate, PagoResponse
+from app.services.gestion_operativa_web.notificacion_service import enviar_notificacion_push
+from app.services.inteligencia_automatizacion.multimodal_ai_service import analyze_image_file, transcribe_audio_file
+from app.services.inteligencia_automatizacion.prioridad_service import calcular_prioridad
+from app.services.inteligencia_automatizacion.triage_service import analyze_incident, estimate_repair_cost
+from app.services.pagos_facturacion.invoice_pdf_service import build_invoice_pdf, format_bs
+from app.services.pagos_facturacion.payment_service import calculate_payment_breakdown
 from app.utils.auth import get_subject_from_token
 from app.utils.geo import calcular_distancia_km
 

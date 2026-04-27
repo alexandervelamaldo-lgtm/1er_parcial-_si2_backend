@@ -3,7 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.middleware.error_handler import unhandled_exception_handler
-from app.routers import auth, clientes, mapa, notificaciones, solicitudes, talleres, tecnicos, vehiculos
+from app.routers.autenticacion_acceso import auth
+from app.routers.gestion_operativa_web import clientes, notificaciones, talleres, tecnicos
+from app.routers.gestion_solicitudes import solicitudes, vehiculos
+from app.routers.seguimiento_cliente_web import mapa
 
 
 settings = get_settings()
