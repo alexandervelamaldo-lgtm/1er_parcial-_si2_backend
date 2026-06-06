@@ -19,10 +19,12 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, get_tenant_sessionmaker
 from app.dependencies.auth import get_current_user, get_role_names
+from app.models.solicitudes import Solicitud
 from app.models.users import User
 from app.services.tenant_registry import TenantInfo, tenant_registry
 
@@ -82,16 +84,23 @@ def _require_super_admin(current_user: User = Depends(get_current_user)) -> User
     return current_user
 
 
-async def _count_in_tenant(tenant_key: str, sql: str) -> int:
-    """Runs a single COUNT(*) query against the given tenant's DB. Failures
-    are swallowed and reported as ``-1`` so one broken tenant doesn't break
-    the whole admin listing."""
-    from sqlalchemy import text
-
+async def _count_users_in_tenant(tenant_key: str) -> int:
+    """Counts users within the target tenant schema."""
     try:
         sessionmaker = get_tenant_sessionmaker(tenant_key)
         async with sessionmaker() as session:
-            result = await session.execute(text(sql))
+            result = await session.execute(select(func.count()).select_from(User))
+            return int(result.scalar() or 0)
+    except Exception:
+        return -1
+
+
+async def _count_solicitudes_in_tenant(tenant_key: str) -> int:
+    """Counts solicitudes within the target tenant schema."""
+    try:
+        sessionmaker = get_tenant_sessionmaker(tenant_key)
+        async with sessionmaker() as session:
+            result = await session.execute(select(func.count()).select_from(Solicitud))
             return int(result.scalar() or 0)
     except Exception:
         return -1
