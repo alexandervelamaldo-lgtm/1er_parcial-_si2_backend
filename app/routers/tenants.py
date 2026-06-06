@@ -105,8 +105,8 @@ async def list_admin_tenants(_admin: User = Depends(_require_super_admin)) -> li
     results = await asyncio.gather(
         *[
             asyncio.gather(
-                _count_in_tenant(t.key, "SELECT COUNT(*) FROM users"),
-                _count_in_tenant(t.key, "SELECT COUNT(*) FROM solicitudes"),
+                _count_users_in_tenant(t.key),
+                _count_solicitudes_in_tenant(t.key),
             )
             for t in tenants
         ],
