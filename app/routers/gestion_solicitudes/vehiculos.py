@@ -6,7 +6,7 @@ from app.database import get_db
 from app.dependencies.auth import get_current_cliente_id, get_current_user, get_role_names
 from app.models.vehiculos import Vehiculo
 from app.models.users import User
-from app.schemas.vehiculos import VehiculoCreate, VehiculoResponse, VehiculoUpdate
+from app.schemas.gestion_solicitudes.vehiculos import VehiculoCreate, VehiculoResponse, VehiculoUpdate
 
 
 router = APIRouter(prefix="/vehiculos", tags=["Vehículos"])

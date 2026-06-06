@@ -90,6 +90,115 @@ PREMIUM_BRANDS = {"bmw", "mercedes", "audi", "lexus", "volvo", "mini", "porsche"
 ECONOMIC_BRANDS = {"suzuki", "toyota", "nissan", "hyundai", "kia", "renault", "chevrolet", "fiat"}
 
 
+# ── Risk level inference ──────────────────────────────────────────────────────
+#
+# Replaces the manual client-side "Nivel de riesgo" slider. The client should
+# no longer pick its own risk; instead we infer 1..5 from textual signals
+# (description, type, road flag, vehicle condition, AI transcript & summary, and
+# any visual severity detected from attached images). This keeps the source of
+# truth on the server and prevents clients from inflating/deflating risk.
+
+_RISK_KEYWORDS = {
+    # Highest impact ──────────────────────────────────────────────────────────
+    5: [
+        "volcado", "volcadura", "incendio", "fuego",
+        "perdida total", "pérdida total", "irreparable",
+        "atrapado", "heridos graves", "fatal", "muerto",
+    ],
+    # Severe ──────────────────────────────────────────────────────────────────
+    4: [
+        "choque fuerte", "colision", "colisión", "accidente",
+        "airbag", "estructural", "radiador roto",
+        "humo", "sin frenos", "fuga",
+        "heridos", "lesion", "lesión", "ambulancia",
+    ],
+    # Moderate ────────────────────────────────────────────────────────────────
+    3: [
+        "no arranca", "inmovilizado", "motor",
+        "parachoque", "paragolpe", "faro roto",
+        "lateral", "puerta", "abolladura grande",
+        "carretera", "ruta",
+    ],
+    # Low ─────────────────────────────────────────────────────────────────────
+    2: [
+        "llanta", "neumatico", "neumático", "pinchada", "ponchada",
+        "bateria", "batería", "combustible", "gasolina",
+        "rayon", "rayón", "abolladura leve",
+    ],
+}
+
+_SEVERITY_TO_RISK = {
+    "LEVE":      2,
+    "MODERADO":  3,
+    "SEVERO":    4,
+    "CRITICO":   5,
+    "CRÍTICO":   5,
+}
+
+
+def infer_risk_level(
+    *,
+    tipo_incidente: str,
+    descripcion: str,
+    es_carretera: bool,
+    condicion_vehiculo: str,
+    transcripcion_audio: str | None = None,
+    resumen_ia: str | None = None,
+    visual_severity: str | None = None,
+    hint: int | None = None,
+) -> int:
+    """
+    Compute an automatic risk level (1..5) from the available textual + visual
+    signals. ``hint`` is an optional client-provided value that is used ONLY as
+    a soft prior (capped at the inferred level + 1) — it cannot override the
+    AI's judgement upward by more than one point.
+    """
+    normalized = " ".join(
+        (str(v) or "").lower()
+        for v in (
+            tipo_incidente,
+            descripcion,
+            condicion_vehiculo,
+            transcripcion_audio or "",
+            resumen_ia or "",
+        )
+    )
+
+    # ── Base score from keyword tier ─────────────────────────────────────────
+    risk = 1
+    for tier, keywords in sorted(_RISK_KEYWORDS.items(), reverse=True):
+        if any(token in normalized for token in keywords):
+            risk = max(risk, tier)
+            break
+
+    # ── Visual severity is highly trustworthy when present ───────────────────
+    if visual_severity:
+        mapped = _SEVERITY_TO_RISK.get(visual_severity.strip().upper())
+        if mapped is not None:
+            risk = max(risk, mapped)
+
+    # ── Contextual bumps ────────────────────────────────────────────────────
+    if es_carretera:
+        risk = max(risk, 3)  # roadside incidents are at least moderate
+    cond = (condicion_vehiculo or "").lower()
+    if "inmovilizado" in cond or "no arranca" in cond:
+        risk = max(risk, 3)
+    if len((descripcion or "").strip()) < 15:
+        # Very short descriptions tend to under-report severity; floor at 2.
+        risk = max(risk, 2)
+
+    # ── Apply soft client hint (cannot exceed inferred + 1) ─────────────────
+    if hint is not None:
+        try:
+            hint_int = max(1, min(int(hint), 5))
+        except (TypeError, ValueError):
+            hint_int = None
+        if hint_int is not None:
+            risk = max(risk, min(hint_int, risk + 1))
+
+    return max(1, min(risk, 5))
+
+
 def analyze_incident(
     *,
     tipo_incidente: str,
@@ -277,16 +386,16 @@ def estimate_repair_cost(
             if isinstance(component, str) and component
         )
     )
-    visual_conf_values = [
-        float(item.get("confidence"))
-        for item in visual_entries
-        if item.get("confidence") is not None and isinstance(item.get("confidence"), (int, float))
-    ]
-    visual_factor_values = [
-        float(item.get("visual_factor"))
-        for item in visual_entries
-        if item.get("visual_factor") is not None and isinstance(item.get("visual_factor"), (int, float))
-    ]
+    visual_conf_values: list[float] = []
+    visual_factor_values: list[float] = []
+    for item in visual_entries:
+        confidence_value = item.get("confidence")
+        if isinstance(confidence_value, (int, float)):
+            visual_conf_values.append(float(confidence_value))
+
+        factor_value = item.get("visual_factor")
+        if isinstance(factor_value, (int, float)):
+            visual_factor_values.append(float(factor_value))
     severity_rank = {"LEVE": 1, "MODERADO": 2, "SEVERO": 3, "CRITICO": 4}
     severity_max = "LEVE"
     for item in visual_entries:

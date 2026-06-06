@@ -5,6 +5,7 @@ from sqlalchemy import delete, select
 
 from app.database import AsyncSessionLocal
 from app.models import (
+    CategoriaTaller,
     Cliente,
     DisputaSolicitud,
     EstadoSolicitud,
@@ -36,7 +37,24 @@ INCIDENTES = [
 
 async def reset_tables() -> None:
     async with AsyncSessionLocal() as session:
-        for model in [DisputaSolicitud, PagoSolicitud, EvidenciaSolicitud, HistorialEvento, Notificacion, Solicitud, Vehiculo, Taller, Tecnico, Operador, Cliente, User, Role, TipoIncidente, EstadoSolicitud]:
+        for model in [
+            DisputaSolicitud,
+            PagoSolicitud,
+            EvidenciaSolicitud,
+            HistorialEvento,
+            Notificacion,
+            Solicitud,
+            Vehiculo,
+            Taller,
+            CategoriaTaller,
+            Tecnico,
+            Operador,
+            Cliente,
+            User,
+            Role,
+            TipoIncidente,
+            EstadoSolicitud,
+        ]:
             await session.execute(delete(model))
         await session.commit()
 
@@ -49,7 +67,16 @@ async def seed() -> None:
         estados = {name.value: EstadoSolicitud(nombre=name.value) for name in EstadoSolicitudEnum}
         tipos = {nombre: TipoIncidente(nombre=nombre, descripcion=descripcion) for nombre, descripcion in INCIDENTES}
 
-        session.add_all([*roles.values(), *estados.values(), *tipos.values()])
+        categorias = {
+            "chaperia_pintura": CategoriaTaller(slug="chaperia_pintura", nombre="Chapería y pintura"),
+            "llantas": CategoriaTaller(slug="llantas", nombre="Diagnóstico y reparación de llantas"),
+            "motor": CategoriaTaller(slug="motor", nombre="Reparación de motores"),
+            "electricidad": CategoriaTaller(slug="electricidad", nombre="Sistemas eléctricos"),
+            "suspension": CategoriaTaller(slug="suspension", nombre="Suspensiones"),
+            "general": CategoriaTaller(slug="general", nombre="Servicios generales"),
+        }
+
+        session.add_all([*roles.values(), *estados.values(), *tipos.values(), *categorias.values()])
         await session.flush()
 
         usuarios: list[User] = []
@@ -133,9 +160,94 @@ async def seed() -> None:
 
         talleres_users = [u for u in usuarios if any(role.name == "TALLER" for role in u.roles)]
         talleres = [
-            Taller(user_id=talleres_users[0].id if len(talleres_users) > 0 else None, nombre="Taller Centro", direccion="Av. Central 100", latitud=-17.7836, longitud=-63.1822, telefono="5511111111", capacidad=8, servicios="grúa|batería|diagnóstico", disponible=True, acepta_automaticamente=False),
-            Taller(user_id=talleres_users[1].id if len(talleres_users) > 1 else None, nombre="Taller Norte", direccion="Av. Norte 200", latitud=-17.7487, longitud=-63.1698, telefono="5522222222", capacidad=6, servicios="mecánica|combustible", disponible=True, acepta_automaticamente=True),
-            Taller(nombre="Taller Sur", direccion="Av. Sur 300", latitud=-17.821, longitud=-63.1881, telefono="5533333333", capacidad=5, servicios="llantas|grúa", disponible=True, acepta_automaticamente=False),
+            Taller(
+                user_id=talleres_users[0].id if len(talleres_users) > 0 else None,
+                categoria_id=categorias["electricidad"].id,
+                nombre="Taller Centro",
+                direccion="Av. Central 100",
+                latitud=-17.7836,
+                longitud=-63.1822,
+                telefono="5511111111",
+                horarios="Lun-Sáb 08:00-18:00",
+                certificaciones="ISO 9001",
+                tarifas_base={"electricidad": 850.0, "general": 550.0},
+                descuentos_marca={"TOYOTA": 15.0},
+                rating_promedio=4.6,
+                rating_total=128,
+                capacidad=8,
+                servicios="grúa|batería|diagnóstico",
+                disponible=True,
+                acepta_automaticamente=False,
+            ),
+            Taller(
+                user_id=talleres_users[1].id if len(talleres_users) > 1 else None,
+                categoria_id=categorias["motor"].id,
+                nombre="Taller Norte",
+                direccion="Av. Norte 200",
+                latitud=-17.7487,
+                longitud=-63.1698,
+                telefono="5522222222",
+                horarios="Lun-Vie 08:30-17:30",
+                certificaciones="ASE",
+                tarifas_base={"motor": 2200.0, "general": 650.0},
+                rating_promedio=4.2,
+                rating_total=74,
+                capacidad=6,
+                servicios="mecánica|combustible",
+                disponible=True,
+                acepta_automaticamente=True,
+            ),
+            Taller(
+                categoria_id=categorias["llantas"].id,
+                nombre="Taller Sur",
+                direccion="Av. Sur 300",
+                latitud=-17.821,
+                longitud=-63.1881,
+                telefono="5533333333",
+                horarios="Lun-Dom 09:00-20:00",
+                certificaciones="",
+                tarifas_base={"llantas": 320.0, "general": 500.0},
+                rating_promedio=4.7,
+                rating_total=203,
+                capacidad=5,
+                servicios="llantas|grúa",
+                disponible=True,
+                acepta_automaticamente=False,
+            ),
+            Taller(
+                categoria_id=categorias["chaperia_pintura"].id,
+                nombre="Taller Chapería Express",
+                direccion="Av. Banzer 123",
+                latitud=-17.7602,
+                longitud=-63.1835,
+                telefono="5544444444",
+                horarios="Lun-Sáb 08:00-19:00",
+                certificaciones="PPG Certified",
+                tarifas_base={"chaperia_pintura": 1800.0, "general": 700.0},
+                rating_promedio=4.4,
+                rating_total=61,
+                capacidad=7,
+                servicios="chapería|pintura|pulido",
+                disponible=True,
+                acepta_automaticamente=False,
+            ),
+            Taller(
+                categoria_id=categorias["suspension"].id,
+                nombre="Taller Suspensión Pro",
+                direccion="Av. Doble Vía La Guardia 456",
+                latitud=-17.8058,
+                longitud=-63.2029,
+                telefono="5555555555",
+                horarios="Lun-Sáb 08:00-18:30",
+                certificaciones="",
+                tarifas_base={"suspension": 1200.0, "general": 600.0},
+                rating_promedio=4.1,
+                rating_total=39,
+                capacidad=4,
+                servicios="suspensión|alineación|balanceo",
+                disponible=True,
+                acepta_automaticamente=False,
+            ),
         ]
         session.add_all(talleres)
         await session.flush()
@@ -249,6 +361,23 @@ async def seed() -> None:
         admin_user = await session.scalar(select(User).where(User.email == "admin@emergency.com"))
         if admin_user:
             print(f"Seed completado. Usuario administrador: {admin_user.email} / Password123*")
+
+    # ── Super-admin del control plane ──────────────────────────────
+    # El super-admin NO vive dentro de un tenant — está en la control DB.
+    # Lo creamos acá automáticamente para que la demo funcione out-of-
+    # the-box, pero en producción debería crearse con:
+    #     python -m app.control_plane.bootstrap --email X --password Y
+    try:
+        from app.control_plane.bootstrap import bootstrap_super_admin
+        _, created = await bootstrap_super_admin(
+            email="superadmin@platform.com",
+            password="SuperSecret123*",
+            display_name="Super Admin (demo)",
+        )
+        msg = "creado" if created else "ya existía"
+        print(f"Super-admin del control plane {msg}: superadmin@platform.com / SuperSecret123*")
+    except Exception as exc:
+        print(f"AVISO: no se pudo bootstrap super-admin ({type(exc).__name__}). Ejecuta `python -m app.control_plane.bootstrap` manualmente.")
 
 
 if __name__ == "__main__":

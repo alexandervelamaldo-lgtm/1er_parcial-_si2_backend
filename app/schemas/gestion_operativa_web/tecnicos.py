@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
 
-from app.schemas.users import UserResponse
+from app.schemas.autenticacion_acceso.users import UserResponse
 
 
 class TecnicoBase(BaseModel):
@@ -13,6 +13,8 @@ class TecnicoBase(BaseModel):
     latitud_actual: float | None = None
     longitud_actual: float | None = None
     disponibilidad: bool = True
+    radio_cobertura_km: float = Field(default=25.0, gt=0, le=200)
+    en_turno: bool = True
 
 
 class TecnicoCreate(TecnicoBase):
@@ -44,6 +46,8 @@ class TecnicoUpdate(BaseModel):
     latitud_actual: float | None = None
     longitud_actual: float | None = None
     disponibilidad: bool | None = None
+    radio_cobertura_km: float | None = Field(default=None, gt=0, le=200)
+    en_turno: bool | None = None
 
 
 class UbicacionTecnicoUpdate(BaseModel):

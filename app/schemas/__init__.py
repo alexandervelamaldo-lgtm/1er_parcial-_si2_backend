@@ -1,15 +1,15 @@
-from app.schemas.auth import LoginRequest, RegisterRequest, ResetPasswordRequest, TokenResponse
-from app.schemas.clientes import ClienteCreate, ClienteResponse, ClienteUpdate
-from app.schemas.notificaciones import NotificacionResponse
-from app.schemas.solicitudes import SolicitudAsignar, SolicitudCreate, SolicitudEstadoUpdate, SolicitudResponse
-from app.schemas.tecnicos import (
+from app.schemas.autenticacion_acceso.auth import LoginRequest, RegisterRequest, ResetPasswordRequest, TokenResponse
+from app.schemas.gestion_operativa_web.clientes import ClienteCreate, ClienteResponse, ClienteUpdate
+from app.schemas.gestion_operativa_web.notificaciones import NotificacionResponse
+from app.schemas.gestion_solicitudes.solicitudes import SolicitudAsignar, SolicitudCreate, SolicitudEstadoUpdate, SolicitudResponse
+from app.schemas.gestion_operativa_web.tecnicos import (
     DisponibilidadTecnicoUpdate,
     TecnicoCreate,
     TecnicoResponse,
     TecnicoUpdate,
     UbicacionTecnicoUpdate,
 )
-from app.schemas.vehiculos import VehiculoCreate, VehiculoResponse, VehiculoUpdate
+from app.schemas.gestion_solicitudes.vehiculos import VehiculoCreate, VehiculoResponse, VehiculoUpdate
 
 __all__ = [
     "LoginRequest",

@@ -14,6 +14,7 @@ class Notificacion(Base):
     titulo: Mapped[str] = mapped_column(String(150), nullable=False)
     mensaje: Mapped[str] = mapped_column(Text, nullable=False)
     tipo: Mapped[str] = mapped_column(String(60), nullable=False)
+    diagnostico_categoria: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     leida: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     fecha_creacion: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

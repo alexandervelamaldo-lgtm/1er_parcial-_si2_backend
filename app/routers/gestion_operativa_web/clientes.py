@@ -10,9 +10,9 @@ from app.models.roles import Role
 from app.models.solicitudes import Solicitud
 from app.models.users import User
 from app.models.vehiculos import Vehiculo
-from app.schemas.clientes import ClienteCreate, ClienteResponse, ClienteUpdate
-from app.schemas.solicitudes import SolicitudResponse
-from app.schemas.vehiculos import VehiculoResponse
+from app.schemas.gestion_operativa_web.clientes import ClienteCreate, ClienteResponse, ClienteUpdate
+from app.schemas.gestion_solicitudes.solicitudes import SolicitudResponse
+from app.schemas.gestion_solicitudes.vehiculos import VehiculoResponse
 from app.utils.auth import hash_password
 
 

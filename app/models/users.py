@@ -25,6 +25,8 @@ class User(Base):
         onupdate=func.now(),
         nullable=False,
     )
+    ai_consent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ai_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     roles = relationship(
         "Role",
@@ -38,4 +40,11 @@ class User(Base):
     operador = relationship("Operador", back_populates="user", uselist=False)
     notificaciones = relationship("Notificacion", back_populates="usuario")
     device_tokens = relationship("UserDeviceToken", back_populates="usuario", cascade="all, delete-orphan")
+    web_push_subscriptions = relationship("WebPushSubscription", back_populates="usuario", cascade="all, delete-orphan")
+    notification_preferences = relationship(
+        "UserNotificationPreferences",
+        back_populates="usuario",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
     eventos = relationship("HistorialEvento", back_populates="usuario")

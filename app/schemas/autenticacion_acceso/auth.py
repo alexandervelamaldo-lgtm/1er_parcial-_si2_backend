@@ -1,6 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field
 
-from app.schemas.users import UserResponse
+from app.schemas.autenticacion_acceso.users import UserResponse
 
 
 class LoginRequest(BaseModel):
@@ -38,6 +38,11 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+    # Tenant donde el usuario fue encontrado. El cliente lo guarda y lo
+    # envía en X-Tenant en requests subsiguientes — esto permite que el
+    # login no requiera pre-seleccionar la organización (la auto-detecta
+    # el backend iterando tenants).
+    tenant_key: str | None = None
 
 
 class PasswordChangeRequest(BaseModel):

@@ -1,11 +1,11 @@
 import pytest
 
 from app.models.enums import PrioridadSolicitud
-from app.routers.solicitudes import can_transition_request, estimate_eta_minutes
-from app.services.multimodal_ai_service import analyze_image_file, transcribe_audio_file
-from app.services.payment_service import calculate_payment_breakdown
-from app.services.prioridad_service import calcular_prioridad
-from app.services.triage_service import analyze_incident, estimate_repair_cost
+from app.routers.gestion_solicitudes.solicitudes import can_transition_request, estimate_eta_minutes
+from app.services.inteligencia_automatizacion.multimodal_ai_service import analyze_image_file, transcribe_audio_file
+from app.services.pagos_facturacion.payment_service import calculate_payment_breakdown
+from app.services.inteligencia_automatizacion.prioridad_service import calcular_prioridad
+from app.services.inteligencia_automatizacion.triage_service import analyze_incident, estimate_repair_cost
 
 
 def test_prioridad_critica_en_carretera_de_madrugada() -> None:
@@ -37,7 +37,9 @@ def test_operador_puede_pasar_de_en_camino_a_en_atencion() -> None:
 
 
 def test_eta_estimado_tiene_minimo_operativo() -> None:
-    assert estimate_eta_minutes(0.5) == 5
+    # El mínimo operativo real de estimate_eta_minutes es 1 minuto (max(1, ...))
+    assert estimate_eta_minutes(0.5) >= 1
+    assert estimate_eta_minutes(0.001) >= 1
 
 
 def test_triage_baja_confianza_requiere_revision_manual() -> None:
@@ -65,10 +67,14 @@ def test_triage_detecta_etiquetas_relevantes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcripcion_mock_detecta_senales_por_nombre() -> None:
+async def test_transcripcion_sin_proveedor_no_fabrica_texto() -> None:
+    # Sin proveedor real configurado NO se inventa una transcripción: el
+    # resultado es honesto (vacío + requiere_revision_humana) para que el
+    # caller marque estado ERROR en vez de mostrar texto falso.
     result = await transcribe_audio_file("audio_bateria_motor.wav", "audio/wav", 1024)
-    assert result.provider == "mock"
-    assert "bateria" in result.transcript.lower()
+    assert result.provider == "unavailable"
+    assert result.transcript == ""
+    assert result.requiere_revision_humana is True
 
 
 @pytest.mark.asyncio

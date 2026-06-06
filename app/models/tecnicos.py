@@ -18,6 +18,8 @@ class Tecnico(Base):
     latitud_actual: Mapped[float | None] = mapped_column(Float, nullable=True)
     longitud_actual: Mapped[float | None] = mapped_column(Float, nullable=True)
     disponibilidad: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    radio_cobertura_km: Mapped[float] = mapped_column(Float, default=25.0, nullable=False)
+    en_turno: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     ubicacion_actualizada_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=True)
 
     user = relationship("User", back_populates="tecnico", lazy="selectin")

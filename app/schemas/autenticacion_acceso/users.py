@@ -1,7 +1,7 @@
 from pydantic import EmailStr
 
-from app.schemas.common import ORMBaseModel, TimestampedResponse
-from app.schemas.roles import RoleResponse
+from app.schemas.autenticacion_acceso.common import ORMBaseModel, TimestampedResponse
+from app.schemas.autenticacion_acceso.roles import RoleResponse
 
 
 class UserResponse(TimestampedResponse):

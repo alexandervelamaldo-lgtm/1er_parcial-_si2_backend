@@ -10,5 +10,9 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.20
 httpx==0.28.1
 firebase-admin==7.1.0
+pywebpush==2.0.3
 pytest==8.4.1
 pytest-asyncio==1.1.0
+respx==0.22.0
+tzdata==2024.2
+aiosqlite==0.20.0

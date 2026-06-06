@@ -1,7 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field, model_validator
 
-from app.schemas.users import UserResponse
-from app.schemas.vehiculos import VehiculoResponse
+from app.schemas.autenticacion_acceso.users import UserResponse
+from app.schemas.gestion_solicitudes.vehiculos import VehiculoResponse
 
 
 class ClienteBase(BaseModel):

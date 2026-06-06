@@ -11,7 +11,7 @@ from app.models.roles import Role
 from app.models.talleres import Taller
 from app.models.tecnicos import Tecnico
 from app.models.users import User
-from app.schemas.tecnicos import (
+from app.schemas.gestion_operativa_web.tecnicos import (
     DisponibilidadTecnicoUpdate,
     TecnicoCreate,
     TecnicoResponse,
@@ -84,12 +84,10 @@ async def create_technician(
     if all(item.name != "TECNICO" for item in user.roles):
         user.roles.append(role)
 
-    if payload.taller_id is None:
-        raise HTTPException(status_code=400, detail="Debes asignar un taller al crear el técnico")
-
-    taller = await db.get(Taller, payload.taller_id)
-    if not taller:
-        raise HTTPException(status_code=404, detail="Taller no encontrado")
+    if payload.taller_id is not None:
+        taller = await db.get(Taller, payload.taller_id)
+        if not taller:
+            raise HTTPException(status_code=404, detail="Taller no encontrado")
 
     tecnico = Tecnico(
         user_id=user.id,
@@ -100,6 +98,8 @@ async def create_technician(
         latitud_actual=payload.latitud_actual,
         longitud_actual=payload.longitud_actual,
         disponibilidad=payload.disponibilidad,
+        radio_cobertura_km=payload.radio_cobertura_km,
+        en_turno=payload.en_turno,
     )
     db.add(tecnico)
     await db.commit()
