@@ -101,7 +101,7 @@ from app.services.pagos_facturacion.payment_service import calculate_payment_bre
 from app.services.realtime_hub import hub as _realtime_hub
 from app.routers.gestion_operativa_web.kpis import invalidate_kpi_cache_for_tenant
 from jose import JWTError
-from app.models.enums import CategoriaDano, resolve_categoria_diagnostico, try_parse_categoria_dano
+from app.models.enums import CategoriaDano, EstadoSolicitudEnum, resolve_categoria_diagnostico, try_parse_categoria_dano
 from app.utils.auth import decode_token
 from app.utils.geo import calcular_distancia_km
 from app.models.notification_preferences import UserNotificationPreferences
@@ -111,6 +111,7 @@ from app.models.web_push_subscriptions import WebPushSubscription
 router = APIRouter(prefix="/solicitudes", tags=["Solicitudes"])
 settings = get_settings()
 logger = logging.getLogger(__name__)
+KNOWN_REQUEST_STATES = {state.value for state in EstadoSolicitudEnum}
 
 
 # #region debug-point C:web-push-dispatch-report
@@ -210,9 +211,16 @@ TRANSICIONES_OPERATIVAS = {
 
 async def _get_estado_por_nombre(db: AsyncSession, nombre: str) -> EstadoSolicitud:
     estado = await db.scalar(select(EstadoSolicitud).where(EstadoSolicitud.nombre == nombre))
-    if not estado:
-        raise HTTPException(status_code=404, detail=f"Estado {nombre} no encontrado")
-    return estado
+    if estado:
+        return estado
+    if nombre in KNOWN_REQUEST_STATES:
+        # Tenant restored from partial backup or incomplete seed: recreate the
+        # canonical state instead of failing mobile/web request creation.
+        estado = EstadoSolicitud(nombre=nombre)
+        db.add(estado)
+        await db.flush()
+        return estado
+    raise HTTPException(status_code=404, detail=f"Estado {nombre} no encontrado")
 
 
 async def _get_operador_user_ids(db: AsyncSession) -> list[int]:
