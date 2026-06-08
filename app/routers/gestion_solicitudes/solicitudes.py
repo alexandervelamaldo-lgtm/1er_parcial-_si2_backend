@@ -1792,6 +1792,22 @@ async def _create_request_in_session(
         deep_link=f"/solicitudes/{solicitud.id}",
         diagnostico_categoria=diagnostico_categoria,
     )
+
+    operador_ids = await _get_operador_user_ids(db)
+    if operador_ids:
+        await _notify_users(
+            db,
+            operador_ids,
+            "Nueva solicitud pendiente de asignación",
+            (
+                f"La solicitud #{solicitud.id} fue registrada y requiere revisión operativa "
+                f"para asignar taller. Prioridad: {prioridad.value}. "
+                f"Diagnóstico: {diagnostico_categoria}."
+            ),
+            "SOLICITUD_REGISTRADA",
+            deep_link=f"/solicitudes/{solicitud.id}",
+            diagnostico_categoria=diagnostico_categoria,
+    )
     if triage.requires_manual_review:
         operador_ids = await _get_operador_user_ids(db)
         await _notify_users(
