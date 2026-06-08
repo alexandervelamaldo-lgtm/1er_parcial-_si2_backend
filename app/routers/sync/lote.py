@@ -490,3 +490,4 @@ async def sync_lote(
         errors=err_count,
         results=results,
     )
+
