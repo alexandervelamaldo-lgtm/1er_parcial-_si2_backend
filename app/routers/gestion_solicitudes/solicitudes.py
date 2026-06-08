@@ -116,9 +116,9 @@ KNOWN_REQUEST_STATES = {state.value for state in EstadoSolicitudEnum}
 
 # #region debug-point C:web-push-dispatch-report
 def _debug_report(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
-    _p = ".dbg/mobile-request-push.env"
+    _p = ".dbg/cloud-push-delivery.env"
     _u = None
-    _s = "mobile-request-push"
+    _s = "cloud-push-delivery"
     try:
         with open(_p, encoding="utf-8") as f:
             c = f.read()
