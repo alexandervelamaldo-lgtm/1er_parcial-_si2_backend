@@ -55,6 +55,7 @@ class SolicitudActualizarRutaRequest(BaseModel):
 
 class SolicitudEstadoUpdate(BaseModel):
     estado_id: int
+    estado_nombre: str | None = None
     observacion: str = Field(min_length=3)
 
 
