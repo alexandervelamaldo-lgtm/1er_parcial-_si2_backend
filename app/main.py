@@ -14,7 +14,8 @@ logging.basicConfig(
 from app.routers.analytics import dashboard as analytics_dashboard
 from app.routers.autenticacion_acceso import auth
 from app.routers.gestion_operativa_web import backups, bitacora, clientes, kpis, notificaciones, talleres, tecnicos
-from app.routers.gestion_solicitudes import solicitudes, vehiculos
+import app.routers.gestion_solicitudes.solicitudes as solicitudes
+import app.routers.gestion_solicitudes.vehiculos as vehiculos
 from app.routers.inteligencia_automatizacion import ai as ai_router
 from app.routers.pagos_facturacion import cotizaciones
 from app.routers.pagos_facturacion import paypal as paypal_router
