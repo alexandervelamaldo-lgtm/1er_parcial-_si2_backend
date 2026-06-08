@@ -50,6 +50,7 @@ from app.models.vehiculos import Vehiculo
 from app.routers.gestion_solicitudes.solicitudes import (
     _broadcast_state_change,
     _create_request_in_session,
+    _debug_report,
     _ensure_client_profile_in_tenant,
 )
 from app.schemas.gestion_solicitudes.solicitudes import SolicitudCreate
@@ -227,6 +228,20 @@ async def _handle_crear_solicitud(
     # Las solicitudes creadas en modo offline se centralizan en el tenant default
     # para que las gestione el operador principal.
     target_tenant = "default"
+    # #region debug-point B:offline-target-tenant
+    _debug_report(
+        "B",
+        "backend/app/routers/sync/lote.py:_handle_crear_solicitud",
+        "offline request target tenant resolved",
+        {
+            "source_tenant": tenant,
+            "target_tenant": target_tenant,
+            "cliente_id": cliente_id,
+            "tipo_incidente": tipo_inc.nombre,
+            "offline_ts": offline_ts.isoformat() if offline_ts else None,
+        },
+    )
+    # #endregion
 
     create_payload = SolicitudCreate.model_validate(
         {
@@ -298,6 +313,18 @@ async def _handle_crear_solicitud(
                 target_tipo_id=tipo_incidente_tenant.id,
             )
             if existing:
+                # #region debug-point C:offline-deduplicated
+                _debug_report(
+                    "C",
+                    "backend/app/routers/sync/lote.py:_handle_crear_solicitud",
+                    "offline request deduplicated in target tenant",
+                    {
+                        "target_tenant": target_tenant,
+                        "solicitud_id": existing.id,
+                        "cliente_id": tenant_cliente.id,
+                    },
+                )
+                # #endregion
                 return {"solicitud_id": existing.id, "deduplicado": True}
             result = await _create_request_in_session(
                 db=tenant_db,
@@ -307,6 +334,18 @@ async def _handle_crear_solicitud(
                 tipo_incidente=tipo_incidente_tenant,
                 usuario_id=tenant_cliente.user_id,
             )
+            # #region debug-point A:offline-created-target-tenant
+            _debug_report(
+                "A",
+                "backend/app/routers/sync/lote.py:_handle_crear_solicitud",
+                "offline request created in target tenant",
+                {
+                    "target_tenant": target_tenant,
+                    "solicitud_id": result.id,
+                    "cliente_user_id": tenant_cliente.user_id,
+                },
+            )
+            # #endregion
             await _broadcast_state_change(target_tenant, result.id, "REGISTRADA")
             return {"solicitud_id": result.id, "estado": "REGISTRADA"}
 
@@ -317,6 +356,18 @@ async def _handle_crear_solicitud(
         target_tipo_id=tipo_inc.id,
     )
     if existing:
+        # #region debug-point C:offline-deduplicated-current
+        _debug_report(
+            "C",
+            "backend/app/routers/sync/lote.py:_handle_crear_solicitud",
+            "offline request deduplicated in current tenant",
+            {
+                "target_tenant": tenant,
+                "solicitud_id": existing.id,
+                "cliente_id": cliente_id,
+            },
+        )
+        # #endregion
         return {"solicitud_id": existing.id, "deduplicado": True}
     result = await _create_request_in_session(
         db=db,
@@ -326,6 +377,18 @@ async def _handle_crear_solicitud(
         tipo_incidente=tipo_inc,
         usuario_id=actor_id,
     )
+    # #region debug-point A:offline-created-current-tenant
+    _debug_report(
+        "A",
+        "backend/app/routers/sync/lote.py:_handle_crear_solicitud",
+        "offline request created in current tenant",
+        {
+            "target_tenant": tenant,
+            "solicitud_id": result.id,
+            "cliente_user_id": actor_id,
+        },
+    )
+    # #endregion
     await _broadcast_state_change(tenant, result.id, "REGISTRADA")
     return {"solicitud_id": result.id, "estado": "REGISTRADA"}
 
