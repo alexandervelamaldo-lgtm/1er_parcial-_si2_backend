@@ -996,6 +996,18 @@ async def _dispatch_push_notifications(
 
     result = await db.execute(select(UserDeviceToken).where(UserDeviceToken.user_id.in_(allowed_user_ids)))
     device_tokens = result.scalars().all()
+    logger.info(
+        "Dispatching mobile request push",
+        extra={
+            "tenant": tenant_key,
+            "tipo": tipo,
+            "requested_user_ids": unique_user_ids,
+            "allowed_user_ids": allowed_user_ids,
+            "device_token_count": len(device_tokens),
+            "device_token_user_ids": sorted({device_token.user_id for device_token in device_tokens}),
+            "deep_link": deep_link,
+        },
+    )
     # #region debug-point B:mobile-device-tokens
     _debug_report(
         "B",
