@@ -223,9 +223,10 @@ async def _handle_crear_solicitud(
     tipo_inc = await _resolver_tipo_incidente(db, payload)
     if tipo_inc is None:
         raise ValueError("No hay tipos de incidente configurados en el tenant")
-    target_tenant = await resolve_workshop_tenant_key(tipo_incidente_nombre=tipo_inc.nombre)
-    if not target_tenant:
-        raise ValueError("No se pudo determinar el tenant de talleres para este incidente")
+
+    # Las solicitudes creadas en modo offline se centralizan en el tenant default
+    # para que las gestione el operador principal.
+    target_tenant = "default"
 
     create_payload = SolicitudCreate.model_validate(
         {
@@ -490,4 +491,5 @@ async def sync_lote(
         errors=err_count,
         results=results,
     )
+
 
