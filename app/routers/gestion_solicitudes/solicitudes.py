@@ -4456,149 +4456,161 @@ async def update_request_status(
     solicitud_id: int,
     payload: SolicitudEstadoUpdate,
     current_user: User = Depends(get_current_user),
+    current_cliente_id: int | None = Depends(get_current_cliente_id),
     current_tecnico_id: int | None = Depends(get_current_tecnico_id),
     current_taller_id: int | None = Depends(get_current_taller_id),
     db: AsyncSession = Depends(get_db),
 ) -> Solicitud:
-    solicitud = await db.get(Solicitud, solicitud_id)
-    nuevo_estado = await db.get(EstadoSolicitud, payload.estado_id)
-    if not solicitud or not nuevo_estado:
-        raise HTTPException(status_code=404, detail="Solicitud o estado no encontrado")
-    roles = get_role_names(current_user)
-    if not roles.intersection({"ADMINISTRADOR", "OPERADOR"}):
-        # El dueño del recurso puede operar: el técnico asignado, o el taller
-        # asignado (flujo "taller sin técnico" — el taller despacha y atiende).
-        es_tecnico_duenio = "TECNICO" in roles and solicitud.tecnico_id == current_tecnico_id
-        es_taller_duenio = "TALLER" in roles and solicitud.taller_id == current_taller_id
-        if not (es_tecnico_duenio or es_taller_duenio):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes actualizar esta solicitud")
+    requested_state = await db.get(EstadoSolicitud, payload.estado_id)
+    requested_state_name = requested_state.nombre if requested_state else None
 
-    estado_actual = await db.get(EstadoSolicitud, solicitud.estado_id)
-    if not estado_actual:
-        raise HTTPException(status_code=404, detail="Estado actual no encontrado")
-    if not can_transition_request(estado_actual.nombre, nuevo_estado.nombre, roles):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"No se permite pasar de {estado_actual.nombre} a {nuevo_estado.nombre}",
+    async with _open_solicitud_session(
+        db,
+        solicitud_id,
+        current_user,
+        current_cliente_id,
+        current_tecnico_id,
+        current_taller_id,
+    ) as (solicitud, tenant_db, actor_user_id, _cliente_id, tecnico_id, taller_id):
+        if not solicitud:
+            raise HTTPException(status_code=404, detail="Solicitud o estado no encontrado")
+
+        nuevo_estado = (
+            await _get_estado_por_nombre(tenant_db, requested_state_name)
+            if requested_state_name
+            else await tenant_db.get(EstadoSolicitud, payload.estado_id)
         )
-    if nuevo_estado.nombre == "COMPLETADA":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="La solicitud se completa automáticamente solo después de confirmar el pago final.",
+        if not nuevo_estado:
+            raise HTTPException(status_code=404, detail="Solicitud o estado no encontrado")
+
+        roles = get_role_names(current_user)
+        if not roles.intersection({"ADMINISTRADOR", "OPERADOR"}):
+            # El dueño del recurso puede operar: el técnico asignado, o el taller
+            # asignado (flujo "taller sin técnico" — el taller despacha y atiende).
+            es_tecnico_duenio = "TECNICO" in roles and solicitud.tecnico_id == tecnico_id
+            es_taller_duenio = "TALLER" in roles and solicitud.taller_id == taller_id
+            if not (es_tecnico_duenio or es_taller_duenio):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes actualizar esta solicitud")
+
+        estado_actual = await tenant_db.get(EstadoSolicitud, solicitud.estado_id)
+        if not estado_actual:
+            raise HTTPException(status_code=404, detail="Estado actual no encontrado")
+        if not can_transition_request(estado_actual.nombre, nuevo_estado.nombre, roles):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No se permite pasar de {estado_actual.nombre} a {nuevo_estado.nombre}",
+            )
+        if nuevo_estado.nombre == "COMPLETADA":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La solicitud se completa automáticamente solo después de confirmar el pago final.",
+            )
+        solicitud.estado_id = nuevo_estado.id
+
+        if nuevo_estado.nombre == "EN_ATENCION":
+            solicitud.fecha_atencion = datetime.now(timezone.utc)
+        if nuevo_estado.nombre in {"COMPLETADA", "CANCELADA"}:
+            solicitud.fecha_cierre = datetime.now(timezone.utc)
+            if solicitud.tecnico_id:
+                tecnico = await tenant_db.get(Tecnico, solicitud.tecnico_id)
+                if tecnico:
+                    tecnico.disponibilidad = True
+
+        cliente = await tenant_db.get(Cliente, solicitud.cliente_id)
+        usuario_id = cliente.user_id if cliente else None
+        taller_asignado = await tenant_db.get(Taller, solicitud.taller_id) if solicitud.taller_id else None
+        tecnico_asignado = await tenant_db.get(Tecnico, solicitud.tecnico_id) if solicitud.tecnico_id else None
+
+        estado_nombre = nuevo_estado.nombre
+        _MENSAJES_CLIENTE = {
+            "EN_CAMINO": ("Tu asistencia va en camino", "El equipo del taller va en camino a tu ubicación."),
+            "EN_ATENCION": ("¡El equipo llegó!", "El equipo del taller llegó al lugar del incidente."),
+            "COMPLETADA": ("Servicio completado", "Tu solicitud fue marcada como completada."),
+            "CANCELADA": ("Solicitud cancelada", "Tu solicitud fue cancelada."),
+        }
+        titulo_cliente, cuerpo_cliente = _MENSAJES_CLIENTE.get(
+            estado_nombre,
+            ("Actualización de solicitud", f"Tu solicitud cambió a {estado_nombre}."),
         )
-    solicitud.estado_id = nuevo_estado.id
+        mensaje_cliente = f"{cuerpo_cliente} (Solicitud #{solicitud.id})"
+        notify_operational_ids: list[int] = []
+        titulo_operativo: str | None = None
+        mensaje_operativo: str | None = None
+        tipo_operativo: str | None = None
+        if estado_nombre in {"EN_CAMINO", "EN_ATENCION"}:
+            notify_operational_ids.extend(await _get_operador_user_ids(tenant_db))
+            if taller_asignado and taller_asignado.user_id:
+                notify_operational_ids.append(taller_asignado.user_id)
+            elif tecnico_asignado:
+                notify_operational_ids.append(tecnico_asignado.user_id)
+            if estado_nombre == "EN_CAMINO":
+                titulo_operativo = "Técnico en camino"
+                mensaje_operativo = f"La solicitud #{solicitud.id} salió hacia el incidente."
+                tipo_operativo = "TECNICO_EN_CAMINO"
+            else:
+                titulo_operativo = "Equipo llegó al incidente"
+                mensaje_operativo = f"La solicitud #{solicitud.id} llegó al lugar del incidente y está en atención."
+                tipo_operativo = "CAMBIO_ESTADO"
 
-    if nuevo_estado.nombre == "EN_ATENCION":
-        solicitud.fecha_atencion = datetime.now(timezone.utc)
-    if nuevo_estado.nombre in {"COMPLETADA", "CANCELADA"}:
-        solicitud.fecha_cierre = datetime.now(timezone.utc)
-        if solicitud.tecnico_id:
-            tecnico = await db.get(Tecnico, solicitud.tecnico_id)
-            if tecnico:
-                tecnico.disponibilidad = True
-
-    cliente = await db.get(Cliente, solicitud.cliente_id)
-    usuario_id = cliente.user_id if cliente else None
-    taller_asignado = await db.get(Taller, solicitud.taller_id) if solicitud.taller_id else None
-    tecnico_asignado = await db.get(Tecnico, solicitud.tecnico_id) if solicitud.tecnico_id else None
-
-    # Texto amigable por estado. Se usa tanto para la notificación in-app como
-    # para el PUSH (FCM/WebPush) que llega al teléfono del cliente. Capturamos
-    # `estado_nombre` antes del commit para no leer atributos expirados después.
-    estado_nombre = nuevo_estado.nombre
-    _MENSAJES_CLIENTE = {
-        "EN_CAMINO": ("Tu asistencia va en camino", "El equipo del taller va en camino a tu ubicación."),
-        "EN_ATENCION": ("¡El equipo llegó!", "El equipo del taller llegó al lugar del incidente."),
-        "COMPLETADA": ("Servicio completado", "Tu solicitud fue marcada como completada."),
-        "CANCELADA": ("Solicitud cancelada", "Tu solicitud fue cancelada."),
-    }
-    titulo_cliente, cuerpo_cliente = _MENSAJES_CLIENTE.get(
-        estado_nombre,
-        ("Actualización de solicitud", f"Tu solicitud cambió a {estado_nombre}."),
-    )
-    mensaje_cliente = f"{cuerpo_cliente} (Solicitud #{solicitud.id})"
-    notify_operational_ids: list[int] = []
-    titulo_operativo: str | None = None
-    mensaje_operativo: str | None = None
-    tipo_operativo: str | None = None
-    if estado_nombre in {"EN_CAMINO", "EN_ATENCION"}:
-        notify_operational_ids.extend(await _get_operador_user_ids(db))
-        if taller_asignado and taller_asignado.user_id:
-            notify_operational_ids.append(taller_asignado.user_id)
-        elif tecnico_asignado:
-            notify_operational_ids.append(tecnico_asignado.user_id)
-        if estado_nombre == "EN_CAMINO":
-            titulo_operativo = "Técnico en camino"
-            mensaje_operativo = f"La solicitud #{solicitud.id} salió hacia el incidente."
-            tipo_operativo = "TECNICO_EN_CAMINO"
-        else:
-            titulo_operativo = "Equipo llegó al incidente"
-            mensaje_operativo = f"La solicitud #{solicitud.id} llegó al lugar del incidente y está en atención."
-            tipo_operativo = "CAMBIO_ESTADO"
-
-    db.add(
-        HistorialEvento(
-            solicitud_id=solicitud.id,
-            estado_anterior=estado_actual.nombre if estado_actual else "SIN_ESTADO",
-            estado_nuevo=nuevo_estado.nombre,
-            observacion=payload.observacion,
-            usuario_id=current_user.id,
-        )
-    )
-    if usuario_id:
-        db.add(
-            Notificacion(
-                usuario_id=usuario_id,
-                titulo=titulo_cliente,
-                mensaje=mensaje_cliente,
-                tipo="CAMBIO_ESTADO",
+        tenant_db.add(
+            HistorialEvento(
+                solicitud_id=solicitud.id,
+                estado_anterior=estado_actual.nombre if estado_actual else "SIN_ESTADO",
+                estado_nuevo=nuevo_estado.nombre,
+                observacion=payload.observacion,
+                usuario_id=actor_user_id,
             )
         )
-
-    await db.commit()
-
-    # PUSH real al teléfono del cliente en las transiciones del seguimiento.
-    # Antes el endpoint solo creaba la notificación in-app (sin push), por eso
-    # el cliente nunca recibía el aviso de "en camino" ni de "llegó" al simular
-    # el seguimiento desde la web. Best-effort: si el push falla, el cambio de
-    # estado NO debe revertirse ni lanzar 500.
-    if usuario_id and estado_nombre in {"EN_CAMINO", "EN_ATENCION", "COMPLETADA", "CANCELADA"}:
-        try:
-            await _dispatch_push_notifications(
-                db,
-                [usuario_id],
-                titulo_cliente,
-                mensaje_cliente,
-                "CAMBIO_ESTADO",
-                deep_link=f"/solicitudes/{solicitud_id}",
+        if usuario_id:
+            tenant_db.add(
+                Notificacion(
+                    usuario_id=usuario_id,
+                    titulo=titulo_cliente,
+                    mensaje=mensaje_cliente,
+                    tipo="CAMBIO_ESTADO",
+                )
             )
-        except Exception:
-            # Push best-effort: nunca tumba la actualización de estado.
-            pass
 
-    if notify_operational_ids and titulo_operativo and mensaje_operativo and tipo_operativo:
-        try:
-            await _notify_users(
-                db,
-                notify_operational_ids,
-                titulo_operativo,
-                mensaje_operativo,
-                tipo_operativo,
-                deep_link=f"/solicitudes/{solicitud_id}",
-            )
-            await db.commit()
-        except Exception:
-            # Push/notificación operativa best-effort: el cambio de estado ya fue persistido.
-            await db.rollback()
+        await tenant_db.commit()
 
-    # Broadcast state change to all connected WebSocket clients in this tenant
-    tenant: str = db.info.get("tenant_key", "default")
-    await _broadcast_state_change(
-        tenant, solicitud.id, nuevo_estado.nombre,
-        taller_id=solicitud.taller_id, tecnico_id=solicitud.tecnico_id,
-    )
+        if usuario_id and estado_nombre in {"EN_CAMINO", "EN_ATENCION", "COMPLETADA", "CANCELADA"}:
+            try:
+                await _dispatch_push_notifications(
+                    tenant_db,
+                    [usuario_id],
+                    titulo_cliente,
+                    mensaje_cliente,
+                    "CAMBIO_ESTADO",
+                    deep_link=f"/solicitudes/{solicitud_id}",
+                )
+            except Exception:
+                pass
 
-    result = await _load_request_with_relations(db, solicitud.id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
-    return result
+        if notify_operational_ids and titulo_operativo and mensaje_operativo and tipo_operativo:
+            try:
+                await _notify_users(
+                    tenant_db,
+                    notify_operational_ids,
+                    titulo_operativo,
+                    mensaje_operativo,
+                    tipo_operativo,
+                    deep_link=f"/solicitudes/{solicitud_id}",
+                )
+                await tenant_db.commit()
+            except Exception:
+                await tenant_db.rollback()
+
+        tenant: str = tenant_db.info.get("tenant_key", "default")
+        await _broadcast_state_change(
+            tenant,
+            solicitud.id,
+            nuevo_estado.nombre,
+            taller_id=solicitud.taller_id,
+            tecnico_id=solicitud.tecnico_id,
+        )
+
+        result = await _load_request_with_relations(tenant_db, solicitud.id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+        return result
+
