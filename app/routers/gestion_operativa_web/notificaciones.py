@@ -31,15 +31,17 @@ settings = get_settings()
 # #region debug-point B:web-push-server-report
 def _debug_report(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
     _p = ".dbg/web-push-missing.env"
-    _u = "http://127.0.0.1:7777/event"
+    _u = None
     _s = "web-push-missing"
     try:
         with open(_p, encoding="utf-8") as f:
             c = f.read()
-        _u = next((line.split("=", 1)[1] for line in c.splitlines() if line.startswith("DEBUG_SERVER_URL=")), _u)
+        _u = next((line.split("=", 1)[1] for line in c.splitlines() if line.startswith("DEBUG_SERVER_URL=")), None)
         _s = next((line.split("=", 1)[1] for line in c.splitlines() if line.startswith("DEBUG_SESSION_ID=")), _s)
     except Exception:
         pass
+    if not _u:
+        return
     try:
         payload = {
             "sessionId": _s,
