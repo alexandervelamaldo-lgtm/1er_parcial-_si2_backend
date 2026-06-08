@@ -29,10 +29,7 @@ class SolicitudCreate(BaseModel):
     foto_url: str | None = None
     es_carretera: bool = False
     condicion_vehiculo: str = Field(default="Operativo con limitaciones", min_length=3)
-    # The risk level is now AI-determined server-side. Clients can omit it (default None);
-    # if a value is provided it is treated as a hint and clamped to 1..5.
     nivel_riesgo: int | None = Field(default=None, ge=1, le=5)
-    # Enviado cuando el cliente preselecciona taller desde el mapa
     presupuesto_aceptado: float | None = Field(default=None, gt=0)
 
 
@@ -83,10 +80,6 @@ class SolicitudRevisionManualRequest(BaseModel):
 class SolicitudTrabajoFinalizadoRequest(BaseModel):
     costo_final: float = Field(gt=0)
     observacion: str = Field(min_length=5, max_length=1000)
-    # Confirmación GPS del técnico parado en el sitio. Es OPCIONAL porque un
-    # taller SIN técnico cierra el trabajo de forma remota (flujo "taller sin
-    # técnico") y no aporta una ubicación en terreno. Cuando vienen, el backend
-    # valida que coincidan con el punto del servicio.
     latitud_confirmacion: float | None = Field(default=None, ge=-90, le=90)
     longitud_confirmacion: float | None = Field(default=None, ge=-180, le=180)
 
@@ -147,57 +140,47 @@ class SolicitudCandidatosResponse(BaseModel):
     servicio_unico: ServicioDemandaResponse | None = None
 
 
-# ── Talleres con presupuesto (flujo cliente↔taller-directo) ─────────────
-
-
 class TallerPresupuestoBreakdown(BaseModel):
-    """Desglose del presupuesto que el cliente verá en cada bottom-sheet
-    del mapa móvil. Todos los montos en la moneda del taller (default BOB)."""
-    monto_base:      float          # precio sin descuentos
-    descuento_pct:   float | None   # 15.0 si aplica marca_asociada, 0–100 si descuentos_marca
-    monto_final:     float          # = monto_base * (1 - descuento_pct/100)
-    moneda:          str = "BOB"
-    rango_min:       float          # límite inferior probable
-    rango_max:       float          # límite superior probable
-    tiempo_horas:    float | None = None
-    motivo_descuento: str | None = None  # "Marca asociada del taller" / "Descuento especial Toyota" etc.
-    # Cross-check con la estimación IA (cuando hay solicitud.costo_estimado).
-    # `diverge_ia_pct` es la diferencia relativa absoluta entre el precio del
-    # taller y la estimación IA, en porcentaje. `requiere_revision` se marca
-    # cuando esa diferencia supera el 80% — el cliente puede aceptar igual,
-    # pero la UI lo destaca como "presupuesto inusual".
-    estimacion_ia_min:  float | None = None
-    estimacion_ia_max:  float | None = None
+    monto_base: float
+    descuento_pct: float | None
+    monto_final: float
+    moneda: str = "BOB"
+    rango_min: float
+    rango_max: float
+    tiempo_horas: float | None = None
+    motivo_descuento: str | None = None
+    estimacion_ia_min: float | None = None
+    estimacion_ia_max: float | None = None
     estimacion_ia_prob: float | None = None
-    diverge_ia_pct:     float | None = None
-    requiere_revision:  bool = False
+    diverge_ia_pct: float | None = None
+    requiere_revision: bool = False
 
 
 class TallerConPresupuestoResponse(BaseModel):
-    taller_id:                int
-    nombre:                   str
-    direccion:                str | None = None
-    lat:                      float
-    lng:                      float
-    distancia_km:             float
-    eta_min:                  int | None = None     # null si Mapbox falló
-    rating_promedio:          float
-    capacidad:                int
-    disponible:               bool
-    match_especializacion:    bool                  # categoría del incidente ∈ servicios del taller
-    marca_asociada_descuento: bool                  # 15% por marca asociada aplicable
-    presupuesto:              TallerPresupuestoBreakdown
-    score:                    float                 # 0–1, mayor = mejor recomendación
-    motivo:                   str                   # "Cerca + especializado + descuento marca"
+    taller_id: int
+    nombre: str
+    direccion: str | None = None
+    lat: float
+    lng: float
+    distancia_km: float
+    eta_min: int | None = None
+    rating_promedio: float
+    capacidad: int
+    disponible: bool
+    match_especializacion: bool
+    marca_asociada_descuento: bool
+    presupuesto: TallerPresupuestoBreakdown
+    score: float
+    motivo: str
 
 
 class TalleresConPresupuestoResponse(BaseModel):
-    solicitud_id:   int
-    radio_km:       float
-    total:          int
-    talleres:       list[TallerConPresupuestoResponse]
-    cached_at:      str               # ISO timestamp para que el cliente sepa qué tan fresco está
-    mensaje:        str | None = None # mensaje si no hay talleres o si la consulta tiene observaciones
+    solicitud_id: int
+    radio_km: float
+    total: int
+    talleres: list[TallerConPresupuestoResponse]
+    cached_at: str
+    mensaje: str | None = None
 
 
 class SolicitudSeguimientoResponse(BaseModel):
@@ -221,15 +204,8 @@ class SolicitudSeguimientoResponse(BaseModel):
     longitud_actual: float | None = None
     distancia_km: float | None = None
     eta_min: int | None = None
-    # Rango de incertidumbre del ETA en minutos — la UI debe mostrar
-    # "12-18 min" cuando upper-lower > 5 min y "15 min" cuando es cerrado.
-    # Si no viene, los clientes legacy siguen usando solo `eta_min`.
     eta_min_lower: int | None = None
     eta_min_upper: int | None = None
-    # Geometría GeoJSON (LineString) de la ruta vial taller→incidente cuando el
-    # seguimiento se origina en el taller (flujo "taller sin técnico"). La UI la
-    # dibuja directamente y anima el muñeco sobre ella, así sigue calles reales
-    # en vez de una recta. Si no aplica, la UI cae a `solicitud.ruta_osrm`.
     ruta_seguimiento: dict | None = None
     ubicacion_actualizada_en: datetime | None = None
     ubicacion_desactualizada: bool = False
@@ -344,3 +320,4 @@ class TrabajoRealizadoResumenResponse(BaseModel):
 class TrabajoRealizadoListResponse(BaseModel):
     items: list[TrabajoRealizadoItemResponse]
     resumen: TrabajoRealizadoResumenResponse
+
