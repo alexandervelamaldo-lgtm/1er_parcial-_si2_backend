@@ -223,6 +223,17 @@ async def _get_estado_por_nombre(db: AsyncSession, nombre: str) -> EstadoSolicit
     raise HTTPException(status_code=404, detail=f"Estado {nombre} no encontrado")
 
 
+async def _ensure_known_request_states(db: AsyncSession) -> None:
+    result = await db.execute(select(EstadoSolicitud.nombre))
+    existing = {name for name in result.scalars().all() if name}
+    missing = [name for name in KNOWN_REQUEST_STATES if name not in existing]
+    if not missing:
+        return
+    for nombre in missing:
+        db.add(EstadoSolicitud(nombre=nombre))
+    await db.flush()
+
+
 async def _get_operador_user_ids(db: AsyncSession) -> list[int]:
     result = await db.execute(select(Operador.user_id))
     return list(result.scalars().all())
@@ -1903,6 +1914,7 @@ async def list_request_states(
     _: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[EstadoSolicitud]:
+    await _ensure_known_request_states(db)
     result = await db.execute(select(EstadoSolicitud).order_by(EstadoSolicitud.id))
     return list(result.scalars().all())
 
