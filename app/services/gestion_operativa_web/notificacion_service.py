@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import timedelta
 from pathlib import Path
 
 from firebase_admin import credentials, initialize_app, messaging
@@ -57,10 +58,27 @@ def enviar_notificacion_push(token: str, titulo: str, mensaje: str, data: dict[s
             data=data or {},
             android=messaging.AndroidConfig(
                 priority="high",
+                ttl=timedelta(seconds=30),
+                direct_boot_ok=True,
                 notification=messaging.AndroidNotification(
                     channel_id="emergency_alerts",
                     sound="default",
+                    priority="max",
+                    visibility="public",
+                    default_sound=True,
                     default_vibrate_timings=True,
+                    ticker=titulo,
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                headers={
+                    "apns-priority": "10",
+                    "apns-push-type": "alert",
+                },
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound="default",
+                    )
                 ),
             ),
         )
