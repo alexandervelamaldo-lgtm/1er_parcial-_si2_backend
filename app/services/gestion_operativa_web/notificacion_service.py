@@ -1,5 +1,6 @@
-from pathlib import Path
 import json
+import logging
+from pathlib import Path
 
 from firebase_admin import credentials, initialize_app, messaging
 from firebase_admin.exceptions import FirebaseError
@@ -8,6 +9,7 @@ from app.config import get_settings
 
 
 firebase_app = None
+logger = logging.getLogger(__name__)
 
 
 def inicializar_firebase() -> None:
@@ -18,18 +20,24 @@ def inicializar_firebase() -> None:
     settings = get_settings()
     raw_credentials = (settings.firebase_credentials or "").strip()
     if not raw_credentials:
+        logger.warning("FCM disabled: FIREBASE_CREDENTIALS is empty")
         return
 
     try:
         if raw_credentials.startswith("{"):
             payload = json.loads(raw_credentials)
             firebase_app = initialize_app(credentials.Certificate(payload))
+            logger.info("Firebase Admin initialized from inline JSON credentials")
             return
         credentials_path = Path(raw_credentials)
         if credentials_path.exists():
             firebase_app = initialize_app(credentials.Certificate(str(credentials_path)))
+            logger.info("Firebase Admin initialized from credentials file path")
+            return
+        logger.warning("FCM disabled: FIREBASE_CREDENTIALS path does not exist")
     except Exception:
         firebase_app = None
+        logger.exception("Firebase Admin initialization failed")
         return
 
 
@@ -37,6 +45,10 @@ def enviar_notificacion_push(token: str, titulo: str, mensaje: str, data: dict[s
     try:
         inicializar_firebase()
         if not firebase_app:
+            logger.warning(
+                "Skipping mobile push send because Firebase Admin is not initialized",
+                extra={"token_suffix": token[-12:] if token else "", "title": titulo, "data_keys": sorted((data or {}).keys())},
+            )
             return None
 
         message = messaging.Message(
@@ -52,6 +64,15 @@ def enviar_notificacion_push(token: str, titulo: str, mensaje: str, data: dict[s
                 ),
             ),
         )
-        return messaging.send(message, app=firebase_app)
+        response = messaging.send(message, app=firebase_app)
+        logger.info(
+            "Mobile push sent successfully",
+            extra={"token_suffix": token[-12:] if token else "", "title": titulo, "message_id": response},
+        )
+        return response
     except FirebaseError:
+        logger.exception(
+            "Firebase push send failed",
+            extra={"token_suffix": token[-12:] if token else "", "title": titulo, "data_keys": sorted((data or {}).keys())},
+        )
         return None
