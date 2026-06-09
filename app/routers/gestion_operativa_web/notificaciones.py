@@ -1,4 +1,5 @@
 import json
+import logging
 import urllib.request
 from datetime import datetime, timezone
 
@@ -26,6 +27,7 @@ from app.schemas.gestion_operativa_web.notificaciones import (
 
 router = APIRouter(prefix="/notificaciones", tags=["Notificaciones"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 # #region debug-point B:web-push-server-report
@@ -318,7 +320,17 @@ async def register_device_token(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    tenant_key = db.info.get("tenant_key", settings.default_tenant or "default")
     if "CLIENTE" in get_role_names(current_user):
+        logger.info(
+            "Registering client mobile token across tenants",
+            extra={
+                "tenant": tenant_key,
+                "user_id": current_user.id,
+                "platform": payload.plataforma,
+                "token_suffix": payload.token[-12:] if payload.token else "",
+            },
+        )
         await _sync_client_device_token_across_tenants(
             db=db,
             current_user=current_user,
@@ -326,6 +338,15 @@ async def register_device_token(
             plataforma=payload.plataforma,
         )
         return
+    logger.info(
+        "Registering tenant-scoped mobile token",
+        extra={
+            "tenant": tenant_key,
+            "user_id": current_user.id,
+            "platform": payload.plataforma,
+            "token_suffix": payload.token[-12:] if payload.token else "",
+        },
+    )
     existing = await db.scalar(
         select(UserDeviceToken).where(
             UserDeviceToken.user_id == current_user.id,
