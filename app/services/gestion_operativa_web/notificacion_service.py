@@ -70,7 +70,13 @@ def enviar_notificacion_push(token: str, titulo: str, mensaje: str, data: dict[s
             extra={"token_suffix": token[-12:] if token else "", "title": titulo, "message_id": response},
         )
         return response
-    except FirebaseError:
+    except FirebaseError as exc:
+        if exc.__class__.__name__ == "UnregisteredError":
+            logger.warning(
+                "Firebase token is unregistered",
+                extra={"token_suffix": token[-12:] if token else "", "title": titulo},
+            )
+            return "__UNREGISTERED__"
         logger.exception(
             "Firebase push send failed",
             extra={"token_suffix": token[-12:] if token else "", "title": titulo, "data_keys": sorted((data or {}).keys())},
