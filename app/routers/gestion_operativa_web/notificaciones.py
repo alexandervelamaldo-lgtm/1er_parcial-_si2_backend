@@ -118,12 +118,17 @@ async def _sync_client_device_token_across_tenants(
             user = await session.scalar(select(User).where(User.email == current_user.email))
             if user is None:
                 continue
-            existing = await session.scalar(
+            result = await session.execute(
                 select(UserDeviceToken).where(
                     UserDeviceToken.user_id == user.id,
-                    UserDeviceToken.token == token,
+                    UserDeviceToken.plataforma == plataforma,
                 )
             )
+            existing_tokens = result.scalars().all()
+            existing = next((row for row in existing_tokens if row.token == token), None)
+            for row in existing_tokens:
+                if row.token != token:
+                    await session.delete(row)
             if existing:
                 existing.plataforma = plataforma
             else:
@@ -347,12 +352,17 @@ async def register_device_token(
             "token_suffix": payload.token[-12:] if payload.token else "",
         },
     )
-    existing = await db.scalar(
+    result = await db.execute(
         select(UserDeviceToken).where(
             UserDeviceToken.user_id == current_user.id,
-            UserDeviceToken.token == payload.token,
+            UserDeviceToken.plataforma == payload.plataforma,
         )
     )
+    existing_tokens = result.scalars().all()
+    existing = next((row for row in existing_tokens if row.token == payload.token), None)
+    for row in existing_tokens:
+        if row.token != payload.token:
+            await db.delete(row)
     if existing:
         existing.plataforma = payload.plataforma
     else:
