@@ -1045,7 +1045,20 @@ async def _dispatch_push_notifications(
             },
         )
         # #endregion
-        enviar_notificacion_push(device_token.token, titulo, mensaje, data)
+        send_result = enviar_notificacion_push(device_token.token, titulo, mensaje, data)
+        if send_result == "__UNREGISTERED__":
+            logger.warning(
+                "Removing stale mobile token after FCM unregistered response",
+                extra={
+                    "tenant": tenant_key,
+                    "tipo": tipo,
+                    "target_user_id": device_token.user_id,
+                    "token_suffix": device_token.token[-12:] if device_token.token else "",
+                },
+            )
+            await db.delete(device_token)
+    if device_tokens:
+        await db.flush()
 
     if settings.vapid_private_key and settings.vapid_public_key:
         subscriptions_result = await db.execute(select(WebPushSubscription).where(WebPushSubscription.user_id.in_(allowed_user_ids)))
