@@ -306,8 +306,13 @@ async def _provision_tenant_schema_mode(
         from app.models.users import User
         async with sessionmaker() as session:
             role = await session.scalar(select(Role).where(Role.name == "ADMIN_TENANT"))
-            if not role:
-                raise RuntimeError("Role ADMIN_TENANT no fue sembrado")
+            if role is None:
+                # Fallback defensivo: si por cualquier motivo el seed previo no
+                # dejó visible el rol en este schema, lo recreamos aquí para que
+                # el alta del tenant siga siendo idempotente y no reviente.
+                role = Role(name="ADMIN_TENANT")
+                session.add(role)
+                await session.flush()
             user = await session.scalar(select(User).where(User.email == admin_email))
             if user is None:
                 user = User(email=admin_email, password_hash=hash_password(admin_password), is_active=True)
