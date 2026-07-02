@@ -85,6 +85,13 @@ class Settings(BaseSettings):
         alias="OPENAI_AUDIO_URL",
     )
     openai_audio_api_key: str = Field(default="", alias="OPENAI_AUDIO_API_KEY")
+    # Groq — chatbot conversacional (endpoint /ai/chat). Groq expone una API
+    # compatible con el formato de OpenAI Chat Completions, así que el
+    # servicio le pega directo por httpx sin depender del SDK oficial.
+    # NUNCA se expone al cliente: solo el backend la usa.
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    groq_chat_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_CHAT_MODEL")
+    groq_timeout_s: float = Field(default=15.0, alias="GROQ_TIMEOUT_S")
     # Feature flag: si la calidad de la estimación no satisface en producción,
     # se apaga sin tocar código. Cuando es False, las solicitudes se crean
     # sin costo_ia_* (queda en None) y requiere_revision_humana=True.
