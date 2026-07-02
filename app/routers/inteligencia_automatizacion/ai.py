@@ -10,6 +10,8 @@ from app.dependencies.auth import get_current_user
 from app.models.ai_request_logs import AiRequestLog
 from app.models.users import User
 from app.schemas.inteligencia_automatizacion.ai import (
+    AiChatRequest,
+    AiChatResponse,
     AiConsentRequest,
     AiConsentResponse,
     AiImageAnalyzeResponse,
@@ -21,6 +23,7 @@ from app.schemas.inteligencia_automatizacion.ai import (
     AiVoiceReportNarrationResponse,
 )
 from app.services.inteligencia_automatizacion.gemini_client import GeminiClient
+from app.services.inteligencia_automatizacion.groq_chat_service import enviar_chat
 from app.services.inteligencia_automatizacion.multimodal_ai_service import analyze_image_file
 
 
@@ -238,6 +241,101 @@ async def image_analyze(
         provider=analysis.provider,
         latency_ms=0,
     )
+
+
+_CHAT_SYSTEM_PROMPT = (
+    "Eres el asistente virtual de Emergency, una plataforma SaaS multi-tenant "
+    "de asistencia vehicular de emergencia (grúas, mecánica, chapa y pintura, "
+    "garantía de vehículos nuevos). Responde siempre en español rioplatense "
+    "neutro, de forma breve (2-4 oraciones cuando alcance), clara, amable y "
+    "orientada a la acción. Usá viñetas solo si la respuesta tiene pasos.\n"
+    "\n"
+    "── Contexto del producto ─────────────────────────────────────────────\n"
+    "Roles del sistema:\n"
+    "- CLIENTE: reporta emergencias desde la app móvil y sigue el estado de "
+    "sus solicitudes.\n"
+    "- OPERADOR: recibe las solicitudes, asigna técnicos/talleres y coordina.\n"
+    "- TECNICO: recibe asignaciones y ejecuta el servicio en terreno.\n"
+    "- TALLER: recibe trabajos derivados (mecánica, chapa, etc.) y cobra.\n"
+    "- ADMINISTRADOR / ADMIN_TENANT: gestiona el taller/tenant, ve la "
+    "bitácora, respaldos y analítica.\n"
+    "- SUPER_ADMIN: administra los tenants (talleres) de la plataforma.\n"
+    "\n"
+    "Módulos principales del panel web:\n"
+    "- Solicitudes: crear (cliente), listar, ver detalle, adjuntar fotos "
+    "con análisis de IA integrado.\n"
+    "- Talleres/Técnicos, Clientes: catálogos operativos.\n"
+    "- Bitácora: auditoría de acciones dentro del tenant.\n"
+    "- Respaldos: backup manual y automático de la base del tenant.\n"
+    "- Notificaciones: push (web y FCM) y bandeja histórica.\n"
+    "- Trabajos: cobro y facturación (integración con PayPal).\n"
+    "- Historial: seguimiento de solicitudes del cliente.\n"
+    "- Analítica: KPIs operacionales para administradores.\n"
+    "- Chat (donde estás vos): asistente conversacional general.\n"
+    "\n"
+    "Estados típicos de una solicitud: creada → asignada → en camino → "
+    "en atención → finalizada (o cancelada). Cada cambio dispara "
+    "notificaciones al cliente.\n"
+    "\n"
+    "Funciones de IA disponibles en la plataforma (mencionalas si aplican):\n"
+    "- Análisis de imágenes de la avería desde el detalle de la solicitud "
+    "(no desde este chat).\n"
+    "- Comandos por voz y transcripción de audio en la app móvil.\n"
+    "- Generación de narraciones para reportes operativos.\n"
+    "\n"
+    "── Cómo responder ────────────────────────────────────────────────────\n"
+    "1. Si te preguntan CÓMO hacer algo en la plataforma (reportar, seguir, "
+    "pagar, configurar), respondé con pasos concretos en función del rol "
+    "que menciona el usuario (o preguntá el rol si es ambiguo).\n"
+    "2. Si es una consulta general (saludo, qué hacés, quién sos), presentate "
+    "brevemente y ofrecé 2-3 ejemplos de lo que podés ayudar.\n"
+    "3. Si es una emergencia real en curso (ej. 'me choqué', 'mi auto se "
+    "prendió fuego'), pedile PRIMERO ponerse a salvo y llamar al 911 / "
+    "servicios de emergencia locales, y RECIÉN DESPUÉS explicá cómo crear "
+    "la solicitud en Emergency.\n"
+    "4. No inventes precios, tiempos de respuesta, ni datos específicos de "
+    "un taller o solicitud: esos vienen de la base de datos, no de vos. "
+    "Si te los piden, decí que los revise en el módulo correspondiente.\n"
+    "5. No pidas ni muestres contraseñas, tokens, ni datos de tarjetas.\n"
+    "6. Si la pregunta está fuera del dominio (matemática, código, chismes), "
+    "podés ayudar de forma breve y honesta, pero ofrecé volver al tema de "
+    "la plataforma."
+)
+
+
+@router.post("/chat", response_model=AiChatResponse)
+async def chat(
+    payload: AiChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AiChatResponse:
+    # Abrir el chat y escribir un mensaje es una acción de bajo riesgo
+    # iniciada explícitamente por el usuario, así que auto-otorgamos el
+    # consentimiento (igual que en image/analyze) en vez de bloquear con
+    # un diálogo previo.
+    await _ensure_consent(current_user, db)
+
+    mensajes: list[dict[str, str]] = [{"role": "system", "content": _CHAT_SYSTEM_PROMPT}]
+    mensajes.extend({"role": item.role, "content": item.content} for item in payload.history)
+    mensajes.append({"role": "user", "content": payload.message})
+
+    result = await enviar_chat(mensajes=mensajes)
+    await _log(
+        db,
+        user_id=current_user.id,
+        kind="chat/message",
+        provider="groq",
+        ok=result.ok,
+        latency_ms=result.latency_ms,
+        error=result.error,
+    )
+    if not result.ok:
+        if result.status_code == 401:
+            raise HTTPException(status_code=502, detail="La clave de la API de Groq no es válida o no está configurada.")
+        if result.status_code == 429:
+            raise HTTPException(status_code=429, detail="Se alcanzó el límite de solicitudes a Groq. Intenta de nuevo en unos segundos.")
+        raise HTTPException(status_code=502, detail="No se pudo obtener respuesta del chatbot en este momento.")
+    return AiChatResponse(reply=result.reply, provider="groq", model=result.model, latency_ms=result.latency_ms)
 
 
 @router.post("/voice-report/narration", response_model=AiVoiceReportNarrationResponse)
