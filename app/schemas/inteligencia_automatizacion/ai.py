@@ -69,3 +69,23 @@ class AiVoiceReportNarrationResponse(BaseModel):
     narration: str
     provider: str
     latency_ms: int
+
+
+AiChatRole = Literal["user", "assistant"]
+
+
+class AiChatMessage(BaseModel):
+    role: AiChatRole
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AiChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[AiChatMessage] = Field(default_factory=list, max_length=40)
+
+
+class AiChatResponse(BaseModel):
+    reply: str
+    provider: str
+    model: str
+    latency_ms: int
