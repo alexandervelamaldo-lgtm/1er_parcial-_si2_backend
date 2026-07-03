@@ -14,6 +14,7 @@ from app.models.operadores import Operador
 from app.models.pagos import PagoSolicitud
 from app.models.roles import Role
 from app.models.servicios_taller_demanda import ServicioTallerDemanda
+from app.models.solicitud_chat_audio import SolicitudChatAudioAttachment
 from app.models.solicitud_chat_messages import SolicitudChatMessage
 from app.models.solicitudes import Solicitud
 from app.models.sync_idempotencia import SyncIdempotencia
@@ -43,6 +44,7 @@ __all__ = [
     "Role",
     "ServicioTallerDemanda",
     "Solicitud",
+    "SolicitudChatAudioAttachment",
     "SolicitudChatMessage",
     "SyncIdempotencia",
     "CategoriaTaller",
