@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+.env_test/
+.venv_test/
+
+# Backups locales (dumps de pg_dump — pueden ser MB y contienen datos productivos)
+backups/*.dump
+backups/*.sql
+backups/*.tar
+backups/*.gz
+
+# Logs
+*.log
+logs/
+
+# IDEs / editores
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Alembic — dejamos las versiones (son parte del código) pero ignoramos cache
+alembic/versions/__pycache__/
+
+# NOTA IMPORTANTE
+# ----------------
+# `.env` y `firebase-credentials.json` NO están ignorados por decisión
+# explícita del propietario del repo. Contienen secretos reales:
+#   - SECRET_KEY del JWT
+#   - Contraseña de Postgres
+#   - PAYPAL_CLIENT_SECRET, OPENAI_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY
+#   - VAPID_PRIVATE_KEY, MAPBOX_PUBLIC_TOKEN
+#   - Firebase service account private key
+# Este repo DEBE ser privado en GitHub. Si en algún momento se hace
+# público, rotar TODAS las claves primero.

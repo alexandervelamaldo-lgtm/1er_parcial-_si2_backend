@@ -1,0 +1,639 @@
+from dataclasses import dataclass
+import base64
+import logging
+from pathlib import Path
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+from app.config import get_settings
+from app.services.inteligencia_automatizacion.gemini_client import GeminiClient
+from app.services.inteligencia_automatizacion.openai_audio_service import (
+    transcribe_audio as _openai_transcribe_audio,
+)
+from app.services.inteligencia_automatizacion.openai_vision_service import (
+    analyze_vehicle_image as _openai_analyze_vehicle_image,
+    OpenAIVisionResult,
+)
+
+
+KEYWORD_MAP = {
+    "bateria": ["bateria", "battery", "arranca", "corriente", "alternador"],
+    "llanta": ["llanta", "ponchada", "pinchada", "neumatico", "rueda"],
+    "motor": ["motor", "temperatura", "humo", "aceite", "vibracion"],
+    "choque": ["choque", "colision", "accidente", "impacto", "golpe"],
+    "check_engine": ["check engine", "motor", "tablero", "testigo"],
+    "combustible": ["combustible", "gasolina", "diesel", "tanque"],
+}
+
+
+@dataclass(slots=True)
+class AudioTranscriptionResult:
+    transcript: str
+    confidence: float
+    provider: str
+    # True cuando ningún proveedor real produjo texto: el caller NO debe
+    # tratar el resultado como una transcripción válida ni fabricar texto.
+    requiere_revision_humana: bool = False
+
+
+@dataclass(slots=True)
+class ImageAnalysisResult:
+    labels: list[str]
+    summary: str
+    confidence: float
+    provider: str
+    components: list[str]
+    damage_zones: list[str]
+    severity: str
+    visual_factor: float
+    ocr_text: str | None = None
+    alt_text: str | None = None
+    moderation: dict | None = None
+    # Campos nuevos para el flujo OpenAI con estimación de costo de
+    # reparación. Cuando provider != "openai" o cuando IA_COSTO_HABILITADO
+    # es False, quedan en None y el caller debe ignorarlos. La unidad
+    # siempre es BOB (mercado boliviano).
+    categoria_dano_ia: str | None = None
+    nivel_riesgo_ia: str | None = None  # BAJO|MEDIO|ALTO|CRITICO
+    costo_min_bob: int | None = None
+    costo_max_bob: int | None = None
+    costo_probable_bob: int | None = None
+    costo_confianza: float | None = None
+    costo_desglose: list[dict] | None = None
+    costo_supuestos: list[str] | None = None
+    requiere_revision_humana: bool = False
+    # Métricas para auditar (ia_audit_log)
+    ia_latency_ms: int | None = None
+    ia_tokens_in: int | None = None
+    ia_tokens_out: int | None = None
+    ia_model: str | None = None
+    ia_fallback: bool | None = None
+    ia_error: str | None = None
+
+
+@dataclass(slots=True)
+class ExternalAIResult:
+    transcript: str | None = None
+    labels: list[str] | None = None
+    summary: str | None = None
+    confidence: float | None = None
+    provider: str = "external-http"
+    components: list[str] | None = None
+    damage_zones: list[str] | None = None
+    severity: str | None = None
+    visual_factor: float | None = None
+    ocr_text: str | None = None
+    alt_text: str | None = None
+    moderation: dict | None = None
+
+
+def _extract_labels(*values: str) -> list[str]:
+    normalized = " ".join(value.lower() for value in values if value)
+    labels = [label for label, aliases in KEYWORD_MAP.items() if any(alias in normalized for alias in aliases)]
+    return sorted(set(labels))
+
+
+def _extract_components_and_damage(*values: str) -> tuple[list[str], list[str], str, float]:
+    normalized = " ".join(value.lower() for value in values if value)
+    component_rules = {
+        "parachoques": ["parachoque", "paragolpe", "bumper"],
+        "faro": ["faro", "fanal", "luces"],
+        "capo": ["capo", "capó"],
+        "radiador": ["radiador"],
+        "llanta": ["llanta", "rueda", "neumatico", "neumático"],
+        "motor": ["motor", "humo", "aceite"],
+        "puerta": ["puerta"],
+        "lateral": ["lateral", "costado"],
+    }
+    components = sorted(
+        set(component for component, aliases in component_rules.items() if any(alias in normalized for alias in aliases))
+    )
+    zone_rules = {
+        "frontal": ["frontal", "frente", "choque frontal"],
+        "lateral": ["lateral", "costado"],
+        "trasera": ["trasera", "atras", "atrás", "posterior"],
+    }
+    damage_zones = sorted(set(zone for zone, aliases in zone_rules.items() if any(alias in normalized for alias in aliases)))
+
+    severity = "LEVE"
+    visual_factor = 1.03
+    if any(token in normalized for token in ["abolladura", "rayon", "rayón", "leve"]):
+        severity = "LEVE"
+        visual_factor = 1.05
+    if any(token in normalized for token in ["moderado", "parachoque", "faro roto", "lateral"]):
+        severity = "MODERADO"
+        visual_factor = 1.12
+    if any(token in normalized for token in ["severo", "airbag", "radiador", "estructural", "fuerte", "volcado"]):
+        severity = "SEVERO"
+        visual_factor = 1.28
+    if any(token in normalized for token in ["total", "irreparable", "pérdida total", "perdida total"]):
+        severity = "CRITICO"
+        visual_factor = 1.4
+    return components, damage_zones, severity, visual_factor
+
+
+# ── Puentes OpenAI → formato canónico ──────────────────────────────────────
+
+
+def _severity_from_riesgo(nivel: str | None) -> str:
+    """Mapea nivel_riesgo de OpenAI (BAJO/MEDIO/ALTO/CRITICO) al campo
+    `severity` legacy (LEVE/MODERADO/SEVERO/CRITICO) para no romper
+    consumidores existentes (prioridad_service, triage, etc.)."""
+    table = {
+        "BAJO": "LEVE",
+        "MEDIO": "MODERADO",
+        "ALTO": "SEVERO",
+        "CRITICO": "CRITICO",
+    }
+    return table.get((nivel or "").upper(), "MODERADO")
+
+
+def _visual_factor_from_riesgo(nivel: str | None) -> float:
+    """Factor multiplicador legacy usado por prioridad_service. Lo mantenemos
+    consistente con la severidad inferida."""
+    table = {
+        "BAJO": 1.05,
+        "MEDIO": 1.12,
+        "ALTO": 1.28,
+        "CRITICO": 1.40,
+    }
+    return table.get((nivel or "").upper(), 1.10)
+
+
+async def _try_openai_transcribe(
+    *,
+    file_name: str,
+    mime_type: str | None,
+    file_bytes: bytes | None,
+) -> AudioTranscriptionResult | None:
+    """Intenta transcribir con OpenAI Whisper. Devuelve None si el provider
+    no está configurado o si la llamada falló (caller cae a otro provider)."""
+    settings = get_settings()
+    if settings.ai_provider != "openai" or not settings.openai_api_key:
+        return None
+    if not file_bytes:
+        return None
+    result = await _openai_transcribe_audio(
+        audio_bytes=file_bytes,
+        file_name=file_name,
+        mime_type=mime_type,
+    )
+    if result.fallback or not result.transcript:
+        return None
+    return AudioTranscriptionResult(
+        transcript=result.transcript,
+        confidence=result.confidence,
+        provider="openai",
+    )
+
+
+async def _try_openai_vision(
+    *,
+    file_name: str,
+    mime_type: str | None,
+    context: str,
+    file_bytes: bytes | None,
+) -> tuple[ImageAnalysisResult, OpenAIVisionResult] | None:
+    """Intenta analizar con OpenAI gpt-4o-mini + costo. Devuelve None si el
+    provider no está configurado o si la imagen está vacía. Si la llamada
+    fallaba retornaríamos None también, PERO el servicio OpenAI ya hace su
+    propio fallback degradado, por lo que devolvemos ese resultado degradado
+    (con requiere_revision_humana=True) para que el caller decida si seguir
+    intentando con Gemini o no.
+
+    Diseño: si AI_PROVIDER="openai", confiamos en OpenAI y NO caemos a
+    Gemini (sería pagarle a dos providers). Solo caemos al mock si OpenAI
+    está totalmente apagada."""
+    settings = get_settings()
+    if settings.ai_provider != "openai" or not settings.openai_api_key:
+        return None
+    if not file_bytes:
+        return None
+    oa = await _openai_analyze_vehicle_image(
+        image_bytes=file_bytes,
+        mime_type=mime_type,
+        context=context,
+    )
+
+    # Adaptamos al schema canónico legacy. Si OpenAI falló (fallback=True)
+    # devolvemos labels=[] y confidence=0, así el caller puede registrar el
+    # análisis pero el flujo sigue.
+    severity = _severity_from_riesgo(oa.nivel_riesgo)
+    visual_factor = _visual_factor_from_riesgo(oa.nivel_riesgo)
+    descripcion = oa.descripcion or (
+        "Análisis automático no concluyente." if oa.fallback else ""
+    )
+    labels = [oa.categoria_dano] if oa.categoria_dano and oa.categoria_dano != "general" else []
+
+    # Feature flag: si IA_COSTO_HABILITADO=False, descartamos costo.
+    costo_habilitado = bool(settings.ia_costo_habilitado)
+    costo = oa.costo_estimado if (costo_habilitado and oa.costo_estimado) else None
+
+    # Heurística inicial de requiere_revision_humana:
+    #  - fallback=True (la IA no pudo)
+    #  - o confianza del análisis muy baja (<0.3)
+    #  - o confianza del costo muy baja (<0.4) cuando hay costo
+    requiere_revision = oa.fallback or oa.confianza_analisis < 0.3
+    if costo and costo.confianza_costo < 0.4:
+        requiere_revision = True
+
+    result = ImageAnalysisResult(
+        labels=labels,
+        summary=descripcion,
+        confidence=oa.confianza_analisis,
+        provider="openai" if not oa.fallback else "openai-fallback",
+        components=[],  # OpenAI no devuelve componentes — quedan vacíos.
+        damage_zones=[],
+        severity=severity,
+        visual_factor=visual_factor,
+        ocr_text=None,
+        alt_text=descripcion or None,
+        moderation={"allowed": True, "reason": "openai", "categories": []},
+        categoria_dano_ia=oa.categoria_dano,
+        nivel_riesgo_ia=oa.nivel_riesgo,
+        costo_min_bob=costo.minimo if costo else None,
+        costo_max_bob=costo.maximo if costo else None,
+        costo_probable_bob=costo.mas_probable if costo else None,
+        costo_confianza=costo.confianza_costo if costo else None,
+        costo_desglose=(
+            [
+                {"concepto": it.concepto, "min": it.minimo, "max": it.maximo}
+                for it in costo.desglose
+            ]
+            if costo
+            else None
+        ),
+        costo_supuestos=list(costo.supuestos) if costo else None,
+        requiere_revision_humana=requiere_revision,
+        ia_latency_ms=oa.latency_ms,
+        ia_tokens_in=oa.tokens_in,
+        ia_tokens_out=oa.tokens_out,
+        ia_model=oa.model,
+        ia_fallback=oa.fallback,
+        ia_error=oa.error,
+    )
+    return result, oa
+
+
+async def _call_external_provider(kind: str, payload: dict[str, str | int | float]) -> ExternalAIResult | None:
+    settings = get_settings()
+    if settings.ai_provider != "http" or not settings.ai_http_endpoint:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if settings.ai_api_key:
+        headers["Authorization"] = f"Bearer {settings.ai_api_key}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                settings.ai_http_endpoint.rstrip("/") + f"/{kind}",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+    return ExternalAIResult(
+        transcript=data.get("transcript"),
+        labels=list(data.get("labels", [])),
+        summary=data.get("summary"),
+        confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
+        components=list(data.get("components", [])) if isinstance(data.get("components"), list) else None,
+        damage_zones=list(data.get("damage_zones", [])) if isinstance(data.get("damage_zones"), list) else None,
+        severity=data.get("severity"),
+        visual_factor=float(data["visual_factor"]) if data.get("visual_factor") is not None else None,
+    )
+
+
+async def _call_gemini_transcribe(
+    *,
+    file_name: str,
+    mime_type: str | None,
+    size_bytes: int,
+    file_bytes: bytes | None,
+) -> ExternalAIResult | None:
+    settings = get_settings()
+    if settings.ai_provider != "gemini" or not (settings.google_api_key or settings.ai_api_key):
+        return None
+    if not file_bytes:
+        return None
+
+    model = settings.gemini_text_model
+    client = GeminiClient()
+    system = (
+        "Eres un asistente que transcribe audio en español. "
+        "Devuelve exclusivamente JSON válido con este esquema: "
+        '{"transcript":"...","confidence":0.0}.'
+    )
+    user = f"Transcribe este audio. Nombre={file_name}. Tamaño={size_bytes} bytes."
+    call, data = await client.generate_json(
+        model=model,
+        system=system,
+        user=user,
+        inline_bytes=file_bytes,
+        inline_mime_type=mime_type or "audio/mpeg",
+        temperature=0.0,
+        max_output_tokens=768,
+    )
+    if not call.ok or not data:
+        return None
+    transcript = data.get("transcript")
+    if not isinstance(transcript, str) or not transcript.strip():
+        return None
+    confidence = data.get("confidence")
+    conf_value = float(confidence) if isinstance(confidence, (int, float)) else 0.75
+    return ExternalAIResult(
+        transcript=transcript.strip(),
+        confidence=max(0.1, min(conf_value, 0.99)),
+        provider="gemini",
+    )
+
+
+async def _call_gemini_vision(
+    *,
+    file_name: str,
+    mime_type: str | None,
+    context: str,
+    file_bytes: bytes | None,
+) -> ExternalAIResult | None:
+    settings = get_settings()
+    if settings.ai_provider != "gemini" or not (settings.google_api_key or settings.ai_api_key):
+        return None
+    if not file_bytes:
+        return None
+
+    model = settings.gemini_vision_model or settings.gemini_text_model
+    client = GeminiClient()
+    system = (
+        "Analiza una imagen y devuelve exclusivamente JSON válido con este esquema: "
+        '{"labels":["..."],"summary":"...","confidence":0.0,'
+        '"components":["..."],"damage_zones":["..."],"severity":"LEVE|MODERADO|SEVERO|CRITICO","visual_factor":1.0,'
+        '"ocr_text":"...","alt_text":"...","moderation":{"allowed":true,"reason":"...","categories":["..."]}}.'
+    )
+    user = (
+        "1) Detecta señales de daño vehicular.\n"
+        "2) Extrae texto visible (OCR) si existe.\n"
+        "3) Genera una descripción accesible (alt_text).\n"
+        "4) Indica si el contenido es apropiado (moderation.allowed).\n"
+        f"Contexto: {context}\n"
+        f"Archivo: {file_name}"
+    )
+    call, data = await client.generate_json(
+        model=model,
+        system=system,
+        user=user,
+        inline_bytes=file_bytes,
+        inline_mime_type=mime_type or "image/jpeg",
+        temperature=0.1,
+        max_output_tokens=900,
+    )
+    if not call.ok or not data:
+        return None
+    labels = data.get("labels")
+    if labels is not None and not isinstance(labels, list):
+        labels = None
+    confidence_raw = data.get("confidence")
+    visual_factor_raw = data.get("visual_factor")
+    return ExternalAIResult(
+        labels=[str(x) for x in (labels or []) if str(x).strip()],
+        summary=str(data.get("summary") or "").strip() or None,
+        confidence=float(confidence_raw) if isinstance(confidence_raw, (int, float)) else None,
+        provider="gemini",
+        components=[str(x) for x in (data.get("components") or [])] if isinstance(data.get("components"), list) else None,
+        damage_zones=[str(x) for x in (data.get("damage_zones") or [])] if isinstance(data.get("damage_zones"), list) else None,
+        severity=str(data.get("severity") or "").strip() or None,
+        visual_factor=float(visual_factor_raw) if isinstance(visual_factor_raw, (int, float)) else None,
+        ocr_text=str(data.get("ocr_text") or "").strip() or None,
+        alt_text=str(data.get("alt_text") or "").strip() or None,
+        moderation=data.get("moderation") if isinstance(data.get("moderation"), dict) else None,
+    )
+
+
+def persist_image_ai_outcome(solicitud, image_analysis: "ImageAnalysisResult", db) -> None:
+    """Persiste en una solicitud todos los efectos de un análisis de imagen IA.
+
+    Es seguro llamarlo aunque el provider sea Gemini o mock — los campos
+    nuevos vienen con None y este helper simplemente no toca esas columnas.
+    Idempotente: si una columna ya tenía valor más confiable, no se
+    sobrescribe a la baja.
+
+    Args:
+        solicitud: instancia ORM `Solicitud` (debe estar attached a la sesión).
+        image_analysis: resultado de `analyze_image_file`.
+        db: AsyncSession activa — usada solo para `add()` del audit log.
+    """
+    # Tags clásicos.
+    solicitud.resumen_ia = image_analysis.summary or solicitud.resumen_ia
+    solicitud.proveedor_ia = image_analysis.provider
+    solicitud.clasificacion_confianza = max(
+        solicitud.clasificacion_confianza or 0.0, image_analysis.confidence,
+    )
+    if image_analysis.confidence < 0.65:
+        solicitud.requiere_revision_manual = True
+
+    # Costo (solo si el provider OpenAI lo trajo).
+    if image_analysis.costo_probable_bob is not None:
+        solicitud.costo_estimado = float(image_analysis.costo_probable_bob)
+        solicitud.costo_estimado_min = float(image_analysis.costo_min_bob or 0)
+        solicitud.costo_estimado_max = float(image_analysis.costo_max_bob or 0)
+        solicitud.costo_estimacion_confianza = image_analysis.costo_confianza
+        solicitud.moneda_costo = "BOB"
+        supuestos = image_analysis.costo_supuestos or []
+        if supuestos:
+            solicitud.costo_estimacion_nota = (
+                "Estimación IA basada en la foto. Supuestos: "
+                + "; ".join(supuestos[:3])
+            )
+        else:
+            solicitud.costo_estimacion_nota = "Estimación IA basada en la foto."
+
+    if image_analysis.requiere_revision_humana:
+        solicitud.requiere_revision_manual = True
+
+    # Audit log granular (best-effort — la auditoría nunca rompe el flujo).
+    try:
+        from app.models.ia_audit_logs import IaAuditLog  # import local: evita ciclo
+        cost_usd = (
+            (image_analysis.ia_tokens_in or 0) * 0.15
+            + (image_analysis.ia_tokens_out or 0) * 0.60
+        ) / 1_000_000.0
+        db.add(
+            IaAuditLog(
+                solicitud_id=solicitud.id,
+                tipo="vision",
+                provider=image_analysis.provider or "unknown",
+                model=image_analysis.ia_model or "",
+                tokens_in=image_analysis.ia_tokens_in or 0,
+                tokens_out=image_analysis.ia_tokens_out or 0,
+                latency_ms=image_analysis.ia_latency_ms or 0,
+                cost_usd=cost_usd,
+                confianza=image_analysis.confidence,
+                fallback=bool(image_analysis.ia_fallback),
+                error=image_analysis.ia_error,
+            )
+        )
+    except Exception:
+        pass
+
+
+async def transcribe_audio_file(
+    file_name: str,
+    mime_type: str | None,
+    size_bytes: int,
+    file_bytes: bytes | None = None,
+) -> AudioTranscriptionResult:
+    payload: dict[str, str | int | float] = {"file_name": file_name, "mime_type": mime_type or "", "size_bytes": size_bytes}
+    if file_bytes:
+        payload["file_base64"] = base64.b64encode(file_bytes).decode("ascii")
+    # 1) OpenAI Whisper si AI_PROVIDER=openai.
+    openai_res = await _try_openai_transcribe(
+        file_name=file_name, mime_type=mime_type, file_bytes=file_bytes,
+    )
+    if openai_res:
+        return openai_res
+    # 2) Gemini si AI_PROVIDER=gemini (rollback / legacy).
+    gemini = await _call_gemini_transcribe(
+        file_name=file_name,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        file_bytes=file_bytes,
+    )
+    if gemini and gemini.transcript:
+        return AudioTranscriptionResult(
+            transcript=gemini.transcript,
+            confidence=gemini.confidence or 0.82,
+            provider=gemini.provider,
+        )
+    external = await _call_external_provider(
+        "transcribe",
+        payload,
+    )
+    if external and external.transcript:
+        return AudioTranscriptionResult(
+            transcript=external.transcript,
+            confidence=external.confidence or 0.82,
+            provider=external.provider,
+        )
+    # Ningún proveedor real (OpenAI/Gemini/externo) produjo texto. NO
+    # fabricamos una transcripción: devolver texto inventado engañaba al
+    # operador haciéndole creer que el audio se transcribió. En su lugar
+    # señalamos que requiere revisión humana y el caller marca el estado
+    # como ERROR con un mensaje honesto.
+    logger.warning(
+        "Transcripción no disponible (ningún proveedor real respondió) — "
+        "archivo=%s, mime=%s, bytes=%d",
+        file_name, mime_type or "", size_bytes,
+    )
+    return AudioTranscriptionResult(
+        transcript="",
+        confidence=0.0,
+        provider="unavailable",
+        requiere_revision_humana=True,
+    )
+
+
+async def analyze_image_file(
+    file_name: str,
+    mime_type: str | None,
+    context: str,
+    file_bytes: bytes | None = None,
+) -> ImageAnalysisResult:
+    payload: dict[str, str | int | float] = {"file_name": file_name, "mime_type": mime_type or "", "context": context}
+    if file_bytes:
+        payload["file_base64"] = base64.b64encode(file_bytes).decode("ascii")
+    # 1) OpenAI gpt-4o-mini + estimación de costo, si AI_PROVIDER=openai.
+    #    Si la llamada falla, _try_openai_vision ya devuelve un resultado
+    #    degradado con requiere_revision_humana=True (no caemos a Gemini
+    #    para no facturarle a dos providers en el mismo flujo).
+    openai_tuple = await _try_openai_vision(
+        file_name=file_name,
+        mime_type=mime_type,
+        context=context,
+        file_bytes=file_bytes,
+    )
+    if openai_tuple is not None:
+        result_oa, _raw = openai_tuple
+        return result_oa
+    # 2) Gemini si AI_PROVIDER=gemini (rollback / legacy).
+    gemini = await _call_gemini_vision(
+        file_name=file_name,
+        mime_type=mime_type,
+        context=context,
+        file_bytes=file_bytes,
+    )
+    if gemini and gemini.labels is not None:
+        labels = gemini.labels
+        summary = gemini.summary or "Análisis de imagen completado"
+        confidence = gemini.confidence or 0.8
+        components, damage_zones, severity, visual_factor = _extract_components_and_damage(file_name, context, summary)
+        if gemini.components is not None:
+            components = gemini.components
+        if gemini.damage_zones is not None:
+            damage_zones = gemini.damage_zones
+        if gemini.severity:
+            severity = gemini.severity
+        if gemini.visual_factor:
+            visual_factor = gemini.visual_factor
+        return ImageAnalysisResult(
+            labels=labels,
+            summary=summary,
+            confidence=confidence,
+            provider=gemini.provider,
+            components=components,
+            damage_zones=damage_zones,
+            severity=severity,
+            visual_factor=visual_factor,
+            ocr_text=gemini.ocr_text,
+            alt_text=gemini.alt_text,
+            moderation=gemini.moderation,
+        )
+    external = await _call_external_provider(
+        "vision",
+        payload,
+    )
+    if external and external.labels is not None:
+        labels = external.labels
+        summary = external.summary or "Análisis de imagen completado"
+        confidence = external.confidence or 0.8
+        components = external.components or []
+        damage_zones = external.damage_zones or []
+        severity = external.severity or "MODERADO"
+        visual_factor = external.visual_factor or (1.22 if severity in {"SEVERO", "CRITICO"} else 1.12)
+        return ImageAnalysisResult(
+            labels=labels,
+            summary=summary,
+            confidence=confidence,
+            provider=external.provider,
+            components=components,
+            damage_zones=damage_zones,
+            severity=severity,
+            visual_factor=visual_factor,
+            ocr_text=external.ocr_text,
+            alt_text=external.alt_text,
+            moderation=external.moderation,
+        )
+    labels = _extract_labels(Path(file_name).stem, context)
+    components, damage_zones, severity, visual_factor = _extract_components_and_damage(Path(file_name).stem, context)
+    summary = (
+        f"La evidencia visual sugiere: {', '.join(labels)}."
+        if labels
+        else "La evidencia visual no aporta una clase concluyente."
+    )
+    if components:
+        summary = f"{summary} Componentes afectados: {', '.join(components)}. Severidad visual: {severity}."
+    confidence = 0.76 if labels or components else 0.48
+    return ImageAnalysisResult(
+        labels=labels,
+        summary=summary,
+        confidence=confidence,
+        provider="mock",
+        components=components,
+        damage_zones=damage_zones,
+        severity=severity,
+        visual_factor=visual_factor,
+        ocr_text=None,
+        alt_text=summary,
+        moderation={"allowed": True, "reason": "mock", "categories": []},
+    )

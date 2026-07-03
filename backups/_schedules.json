@@ -1,0 +1,9 @@
+{
+  "default": {
+    "enabled": true,
+    "frequency": "daily",
+    "hour": 2,
+    "retention": 7,
+    "last_run": "2026-07-02T16:16:44.105985+00:00"
+  }
+}

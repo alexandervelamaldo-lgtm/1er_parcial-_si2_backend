@@ -1,0 +1,53 @@
+services:
+  - type: web
+    name: emergency-backend
+    runtime: docker
+    plan: free
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: TENANT_DATABASES
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
+      - key: SUPER_ADMIN_TOKEN_EXPIRE_MINUTES
+        value: "15"
+      - key: APP_ENV
+        value: production
+      - key: TENANT_STRATEGY
+        value: schema
+      - key: DEFAULT_TENANT
+        value: default
+      - key: BACKEND_BASE_URL
+        value: https://emergency-backend.onrender.com
+      - key: CORS_ORIGINS
+        value: '["https://emergency-frontend.onrender.com"]'
+      - key: CORS_ORIGIN_REGEX
+        value: ""
+      - key: AI_PROVIDER
+        value: mock
+      - key: MAPBOX_PUBLIC_TOKEN
+        sync: false
+      - key: FIREBASE_CREDENTIALS
+        sync: false
+      - key: FCM_PROJECT_ID
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
