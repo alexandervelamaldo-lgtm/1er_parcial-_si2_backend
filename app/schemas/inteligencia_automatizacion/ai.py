@@ -89,3 +89,13 @@ class AiChatResponse(BaseModel):
     provider: str
     model: str
     latency_ms: int
+
+
+class AiChatAdminResponse(BaseModel):
+    reply: str
+    provider: str
+    model: str
+    latency_ms: int
+    # Snapshot que se le inyectó al LLM — devolvemos también al front para
+    # que pueda mostrar los KPIs de referencia si el admin quiere verlos.
+    context_summary: dict[str, Any] | None = None

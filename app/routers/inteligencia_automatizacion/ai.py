@@ -6,10 +6,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies.auth import get_current_user
+from app.dependencies.auth import get_current_user, get_role_names
 from app.models.ai_request_logs import AiRequestLog
 from app.models.users import User
 from app.schemas.inteligencia_automatizacion.ai import (
+    AiChatAdminResponse,
     AiChatRequest,
     AiChatResponse,
     AiConsentRequest,
@@ -22,6 +23,7 @@ from app.schemas.inteligencia_automatizacion.ai import (
     AiVoiceReportNarrationRequest,
     AiVoiceReportNarrationResponse,
 )
+from app.services.inteligencia_automatizacion.admin_kpi_snapshot_service import build_admin_snapshot
 from app.services.inteligencia_automatizacion.gemini_client import GeminiClient
 from app.services.inteligencia_automatizacion.groq_chat_service import enviar_chat
 from app.services.inteligencia_automatizacion.multimodal_ai_service import analyze_image_file
@@ -336,6 +338,104 @@ async def chat(
             raise HTTPException(status_code=429, detail="Se alcanzó el límite de solicitudes a Groq. Intenta de nuevo en unos segundos.")
         raise HTTPException(status_code=502, detail="No se pudo obtener respuesta del chatbot en este momento.")
     return AiChatResponse(reply=result.reply, provider="groq", model=result.model, latency_ms=result.latency_ms)
+
+
+# ── Chat administrativo (web) ────────────────────────────────────────────────
+# Variante del chat orientada a preguntas ejecutivas del tenant. El backend
+# arma un snapshot de KPIs (totales, tasas, top clientes/técnicos/talleres,
+# ingresos, incidentes por tipo) y lo inyecta como contexto en el system
+# prompt. El LLM responde SOLO en base a eso — nunca ejecuta SQL ni acciones.
+
+_ADMIN_CHAT_ROLES = {"ADMINISTRADOR", "ADMIN_TENANT", "OPERADOR"}
+
+
+_ADMIN_CHAT_SYSTEM_PROMPT_TMPL = (
+    "Eres el analista virtual del panel administrativo de Emergency para el "
+    "tenant '{tenant}'. Respondés preguntas del ADMINISTRADOR/OPERADOR sobre "
+    "el desempeño del negocio (solicitudes, clientes, técnicos, talleres, "
+    "tiempos, ingresos) usando EXCLUSIVAMENTE los datos del snapshot que "
+    "aparece más abajo. Estilo: español rioplatense neutro, breve (2-5 "
+    "oraciones cuando alcance), directo, con números concretos.\n"
+    "\n"
+    "── Reglas duras ─────────────────────────────────────────────────────\n"
+    "1. NO inventes datos. Si el snapshot no tiene la respuesta, decilo "
+    "explícitamente y sugerí en qué módulo del panel encontrarla (ej. "
+    "'Analítica', 'Trabajos', 'Bitácora').\n"
+    "2. NO ejecutas SQL ni tomas acciones. Sos solo lectura.\n"
+    "3. Usá los números tal cual — no redondees agresivo, no 'estimes'.\n"
+    "4. Cuando cites un ranking (top clientes/técnicos/talleres), listá "
+    "hasta 3 con nombre y número. Con más, ofrecé que el usuario pida "
+    "'ver los siguientes'.\n"
+    "5. Si te preguntan comparaciones temporales que el snapshot no "
+    "tiene (ej. 'vs mes pasado'), aclará que el snapshot es del momento "
+    "actual y recomendá el dashboard de Analítica.\n"
+    "6. Formato: usá viñetas solo cuando la respuesta sea una lista de "
+    "≥3 items. Cifras monetarias con 'Bs' antes (moneda BOB).\n"
+    "\n"
+    "── Snapshot del tenant (JSON, generado ahora) ───────────────────────\n"
+    "{snapshot_json}\n"
+    "── Fin del snapshot ─────────────────────────────────────────────────\n"
+)
+
+
+@router.post("/chat/admin", response_model=AiChatAdminResponse)
+async def chat_admin(
+    payload: AiChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AiChatAdminResponse:
+    """Chat ejecutivo con KPIs del tenant como contexto.
+
+    Solo accesible para ADMINISTRADOR / ADMIN_TENANT / OPERADOR. El
+    snapshot se calcula fresco en cada llamada (los KPIs cambian con
+    cada acción) y se inyecta al system prompt. El LLM no ve tokens ni
+    puede ejecutar consultas — solo lee JSON estático.
+    """
+    roles = get_role_names(current_user)
+    if not roles.intersection(_ADMIN_CHAT_ROLES):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El chat administrativo requiere rol de administrador u operador.",
+        )
+    await _ensure_consent(current_user, db)
+
+    tenant = db.info.get("tenant_key", "default")
+    snapshot = await build_admin_snapshot(db, tenant)
+    snapshot_dict = snapshot.as_dict()
+    snapshot_json = json.dumps(snapshot_dict, ensure_ascii=False, default=str)
+
+    system_prompt = _ADMIN_CHAT_SYSTEM_PROMPT_TMPL.format(
+        tenant=tenant, snapshot_json=snapshot_json
+    )
+
+    mensajes: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    mensajes.extend({"role": item.role, "content": item.content} for item in payload.history)
+    mensajes.append({"role": "user", "content": payload.message})
+
+    result = await enviar_chat(mensajes=mensajes)
+    await _log(
+        db,
+        user_id=current_user.id,
+        kind="chat/admin",
+        provider="groq",
+        ok=result.ok,
+        latency_ms=result.latency_ms,
+        error=result.error,
+    )
+    if not result.ok:
+        if result.status_code == 401:
+            raise HTTPException(status_code=502, detail="La clave de la API de Groq no es válida o no está configurada.")
+        if result.status_code == 429:
+            raise HTTPException(status_code=429, detail="Se alcanzó el límite de solicitudes a Groq. Intenta de nuevo en unos segundos.")
+        raise HTTPException(status_code=502, detail="No se pudo obtener respuesta del chatbot administrativo en este momento.")
+
+    return AiChatAdminResponse(
+        reply=result.reply,
+        provider="groq",
+        model=result.model,
+        latency_ms=result.latency_ms,
+        context_summary=snapshot_dict,
+    )
 
 
 @router.post("/voice-report/narration", response_model=AiVoiceReportNarrationResponse)
