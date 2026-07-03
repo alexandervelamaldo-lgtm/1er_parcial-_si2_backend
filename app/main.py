@@ -93,6 +93,54 @@ async def _bootstrap_control_plane() -> None:
 
 
 @app.on_event("startup")
+async def _sync_tenant_tables() -> None:
+    """Crea tablas faltantes en cada tenant (idempotente).
+
+    Base.metadata.create_all() con `checkfirst=True` (default) solo crea
+    tablas que NO existen — no modifica columnas ni datos de las que ya
+    están. Esto permite agregar tablas nuevas (ej. solicitud_chat_messages
+    de la migración 021) sin necesidad de correr Alembic por tenant, útil
+    en Render free (sin shell). Modelos existentes con cambios de columnas
+    igual requieren migración explícita.
+
+    Best-effort: cualquier fallo se loggea pero no impide el arranque.
+    """
+    try:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        import app.models  # noqa: F401 - registrar todos los modelos en Base.metadata
+        from app.database import Base
+        from app.services.tenant_registry import tenant_registry
+        from app.tenant_strategy import schema_translate_map_for_tenant
+
+        tenants = tenant_registry.list_keys()
+        if not tenants:
+            return
+        base_url = settings.database_url
+        engine = create_async_engine(base_url, future=True)
+        try:
+            for tenant in tenants:
+                try:
+                    async with engine.begin() as conn:
+                        translated = await conn.execution_options(
+                            schema_translate_map=schema_translate_map_for_tenant(tenant),
+                        )
+                        await translated.run_sync(Base.metadata.create_all)
+                    logging.getLogger(__name__).info(
+                        "tenant_tables — sync OK tenant=%s", tenant,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "tenant_tables — sync FALLÓ tenant=%s (%s)", tenant, type(exc).__name__,
+                    )
+        finally:
+            await engine.dispose()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "tenant_tables — no se pudo sincronizar (%s).", type(exc).__name__,
+        )
+
+
+@app.on_event("startup")
 async def _start_backup_scheduler() -> None:
     """Arranca el loop de respaldos automáticos por tenant.
 
