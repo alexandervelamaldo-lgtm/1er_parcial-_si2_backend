@@ -33,6 +33,7 @@ from app.models.clientes import Cliente
 from app.models.estados_solicitud import EstadoSolicitud
 from app.models.solicitud_chat_messages import SolicitudChatMessage
 from app.models.solicitudes import Solicitud
+from app.models.talleres import Taller
 from app.models.tecnicos import Tecnico
 from app.models.users import User
 from app.schemas.gestion_solicitudes.chat import (
@@ -62,10 +63,17 @@ _ESTADOS_CHAT_ABIERTO = {
 
 async def _resolver_participantes(
     db: AsyncSession, solicitud: Solicitud
-) -> tuple[int | None, int | None]:
-    """Devuelve `(cliente_user_id, tecnico_user_id)` de la solicitud."""
+) -> tuple[int | None, int | None, int | None]:
+    """Devuelve `(cliente_user_id, tecnico_user_id, taller_user_id)` de la solicitud.
+
+    El taller entra al chat en la etapa previa a la asignación de un técnico:
+    cuando el cliente ya eligió taller pero ese taller aún no despachó un
+    técnico individual. Cuando el técnico se asigna, sigue habiendo tres
+    participantes válidos, pero el foco natural pasa a ser cliente↔técnico.
+    """
     cliente_user_id: int | None = None
     tecnico_user_id: int | None = None
+    taller_user_id: int | None = None
     if solicitud.cliente_id is not None:
         cliente_user_id = await db.scalar(
             select(Cliente.user_id).where(Cliente.id == solicitud.cliente_id)
@@ -74,20 +82,24 @@ async def _resolver_participantes(
         tecnico_user_id = await db.scalar(
             select(Tecnico.user_id).where(Tecnico.id == solicitud.tecnico_id)
         )
-    return cliente_user_id, tecnico_user_id
+    if solicitud.taller_id is not None:
+        taller_user_id = await db.scalar(
+            select(Taller.user_id).where(Taller.id == solicitud.taller_id)
+        )
+    return cliente_user_id, tecnico_user_id, taller_user_id
 
 
 async def _autorizar_y_cargar(
     solicitud_id: int,
     current_user: User,
     db: AsyncSession,
-) -> tuple[Solicitud, str, int | None, int | None]:
-    """Verifica acceso y devuelve (solicitud, rol_del_usuario, cliente_uid, tecnico_uid)."""
+) -> tuple[Solicitud, str, int | None, int | None, int | None]:
+    """Verifica acceso y devuelve (solicitud, rol, cliente_uid, tecnico_uid, taller_uid)."""
     solicitud = await db.scalar(select(Solicitud).where(Solicitud.id == solicitud_id))
     if not solicitud:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solicitud no encontrada")
 
-    cliente_uid, tecnico_uid = await _resolver_participantes(db, solicitud)
+    cliente_uid, tecnico_uid, taller_uid = await _resolver_participantes(db, solicitud)
     roles = get_role_names(current_user)
 
     rol_chat: str | None = None
@@ -95,23 +107,29 @@ async def _autorizar_y_cargar(
         rol_chat = "cliente"
     elif tecnico_uid == current_user.id and "TECNICO" in roles:
         rol_chat = "tecnico"
+    elif taller_uid == current_user.id and "TALLER" in roles:
+        rol_chat = "taller"
 
     if not rol_chat:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Solo el cliente y el técnico asignado pueden acceder a este chat.",
+            detail="Solo el cliente, el taller asignado y el técnico asignado pueden acceder a este chat.",
         )
-    return solicitud, rol_chat, cliente_uid, tecnico_uid
+    return solicitud, rol_chat, cliente_uid, tecnico_uid, taller_uid
 
 
 async def _sender_display_name(db: AsyncSession, sender_user_id: int, sender_role: str) -> str:
-    """Nombre corto para mostrar en la burbuja (cliente/técnico → nombre real)."""
+    """Nombre corto para mostrar en la burbuja según el rol del emisor."""
     if sender_role == "cliente":
         nombre = await db.scalar(select(Cliente.nombre).where(Cliente.user_id == sender_user_id))
         if nombre:
             return nombre
     elif sender_role == "tecnico":
         nombre = await db.scalar(select(Tecnico.nombre).where(Tecnico.user_id == sender_user_id))
+        if nombre:
+            return nombre
+    elif sender_role == "taller":
+        nombre = await db.scalar(select(Taller.nombre).where(Taller.user_id == sender_user_id))
         if nombre:
             return nombre
     email = await db.scalar(select(User.email).where(User.id == sender_user_id))
@@ -180,7 +198,7 @@ async def enviar_mensaje(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> SolicitudChatMessageResponse:
-    solicitud, rol_chat, cliente_uid, tecnico_uid = await _autorizar_y_cargar(
+    solicitud, rol_chat, cliente_uid, tecnico_uid, taller_uid = await _autorizar_y_cargar(
         solicitud_id, current_user, db
     )
 
@@ -189,11 +207,11 @@ async def enviar_mensaje(
             status_code=status.HTTP_409_CONFLICT,
             detail="La solicitud ya no está activa; el chat quedó como consulta.",
         )
-    # Si aún no hay técnico asignado, el cliente no tiene con quién chatear.
-    if rol_chat == "cliente" and tecnico_uid is None:
+    # Si aún no hay taller ni técnico, el cliente no tiene contraparte.
+    if rol_chat == "cliente" and tecnico_uid is None and taller_uid is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Aún no hay un técnico asignado a esta solicitud.",
+            detail="Aún no hay un taller ni un técnico asignado a esta solicitud.",
         )
 
     content = payload.content.strip()
@@ -227,7 +245,7 @@ async def enviar_mensaje(
     # tracking. Si el destinatario está desconectado, el mensaje se
     # recupera al reabrir el detalle (queda persistido).
     tenant = _tenant_key(db)
-    destinatarios = [uid for uid in (cliente_uid, tecnico_uid) if uid]
+    destinatarios = [uid for uid in (cliente_uid, tecnico_uid, taller_uid) if uid]
     if destinatarios:
         try:
             await hub.broadcast_to_users(
